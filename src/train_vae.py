@@ -1,0 +1,644 @@
+"""
+Train a 3D VAE on density + susceptibility volumes.
+
+Usage:
+    python src/train_vae.py --zarr_path /path/to/zarr --max_steps 100000
+    accelerate launch src/train_vae.py --zarr_path /path/to/zarr --max_steps 100000
+"""
+
+import argparse
+import json
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Dict, Tuple
+
+import torch
+import torch.nn.functional as F
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data.distributed import DistributedSampler
+from tqdm.auto import tqdm
+
+import wandb
+from vae import VAE3D, VAE3DConfig
+from zarr_dataset import NoddyverseZarrDataset
+
+logging.basicConfig(
+    format="%(asctime)s %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+
+class JointDensitySuscDataset(Dataset):
+    def __init__(self, zarr_path: str):
+        self.base = NoddyverseZarrDataset(
+            zarr_path,
+            fields=("rock_types",),
+            include_metadata=False,
+            return_tensors=True,
+        )
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        sample = self.base[idx]
+        density = sample["density"]
+        susceptibility = sample["susceptibility"]
+        return torch.stack([density, susceptibility], dim=0)
+
+
+def _stats_from_tensor(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute per-channel sum and sumsq for a batch tensor.
+    Returns (sum, sumsq, count).
+    """
+    x = x.float()
+    b, c, d, h, w = x.shape
+    x = x.reshape(b, c, -1)
+    count = torch.tensor(b * x.shape[2], dtype=torch.float32, device=x.device)
+    sum_ = x.sum(dim=(0, 2))
+    sumsq = (x * x).sum(dim=(0, 2))
+    return sum_, sumsq, count
+
+
+def compute_streaming_stats_ddp(
+    dataset: Dataset,
+    batch_size: int,
+    num_workers: int,
+    accelerator: Accelerator,
+) -> Dict[str, torch.Tensor]:
+    if accelerator.num_processes > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            shuffle=False,
+            drop_last=False,
+        )
+    else:
+        sampler = None
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False if sampler is None else False,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True,
+    )
+    if sampler is not None:
+        sampler.set_epoch(0)
+
+    device = accelerator.device
+    count = torch.zeros(1, dtype=torch.float32, device=device)
+    sum_ = torch.zeros(2, dtype=torch.float32, device=device)
+    sumsq = torch.zeros(2, dtype=torch.float32, device=device)
+
+    progress = tqdm(
+        loader,
+        desc="Computing mean/std",
+        disable=not accelerator.is_local_main_process,
+    )
+
+    for batch in progress:
+        batch = batch.to(device, non_blocking=True)
+        batch_sum, batch_sumsq, batch_count = _stats_from_tensor(batch)
+        sum_ += batch_sum
+        sumsq += batch_sumsq
+        count += batch_count
+
+    # All-reduce across processes for exact global sums
+    sum_ = accelerator.reduce(sum_, reduction="sum")
+    sumsq = accelerator.reduce(sumsq, reduction="sum")
+    count = accelerator.reduce(count, reduction="sum")
+
+    mean = sum_ / count
+    var = sumsq / count - mean.pow(2)
+    std = torch.sqrt(var.clamp_min(0))
+
+    return {
+        "count": count.cpu(),
+        "mean": mean.cpu(),
+        "std": std.cpu(),
+    }
+
+
+def load_stats(stats_path: Path) -> Dict[str, torch.Tensor]:
+    with stats_path.open("r") as f:
+        payload = json.load(f)
+    return {
+        "count": torch.tensor(payload["count"], dtype=torch.float64),
+        "mean": torch.tensor(payload["mean"], dtype=torch.float64),
+        "std": torch.tensor(payload["std"], dtype=torch.float64),
+    }
+
+
+def save_stats(stats_path: Path, stats: Dict[str, torch.Tensor]) -> None:
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "count": stats["count"].tolist(),
+        "mean": stats["mean"].tolist(),
+        "std": stats["std"].tolist(),
+    }
+    with stats_path.open("w") as f:
+        json.dump(payload, f, indent=2)
+
+
+@torch.no_grad()
+def evaluate(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    kl_weight: float,
+    accelerator: Accelerator,
+) -> Dict[str, float]:
+    model.eval()
+    device = accelerator.device
+
+    total_recon = torch.tensor(0.0, device=device)
+    total_kl = torch.tensor(0.0, device=device)
+    total_loss = torch.tensor(0.0, device=device)
+    total_samples = torch.tensor(0.0, device=device)
+
+    for batch in dataloader:
+        batch = batch.to(device, non_blocking=True)
+        batch = (batch - mean) / std
+
+        with accelerator.autocast():
+            recon, mu, logvar = model(batch)
+            recon_loss = F.mse_loss(recon, batch)
+            kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            loss = recon_loss + kl_weight * kl_loss
+
+        batch_size = batch.size(0)
+        total_samples += batch_size
+        total_recon += recon_loss.detach() * batch_size
+        total_kl += kl_loss.detach() * batch_size
+        total_loss += loss.detach() * batch_size
+
+    total_recon = accelerator.reduce(total_recon, reduction="sum")
+    total_kl = accelerator.reduce(total_kl, reduction="sum")
+    total_loss = accelerator.reduce(total_loss, reduction="sum")
+    total_samples = accelerator.reduce(total_samples, reduction="sum")
+
+    if total_samples.item() == 0:
+        return {"recon_loss": 0.0, "kl_loss": 0.0, "total_loss": 0.0}
+
+    return {
+        "recon_loss": (total_recon / total_samples).item(),
+        "kl_loss": (total_kl / total_samples).item(),
+        "total_loss": (total_loss / total_samples).item(),
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train 3D VAE with Accelerate")
+
+    # Data
+    parser.add_argument("--zarr_path", type=str, required=True)
+    parser.add_argument("--stats_path", type=str, default=None)
+    parser.add_argument("--recompute_stats", action="store_true")
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--stats_batch_size", type=int, default=8)
+
+    # Model
+    parser.add_argument("--downsample_factor", type=int, default=8)
+    parser.add_argument("--base_channels", type=int, default=24)
+    parser.add_argument("--latent_channels", type=int, default=48)
+    parser.add_argument("--blocks_per_stage", type=int, default=2)
+
+    # Training
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--kl_weight", type=float, default=1e-4)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=10_000_000,
+        help="Total number of samples to process before stopping.",
+    )
+    parser.add_argument(
+        "--eval_every_steps",
+        type=int,
+        default=125_000,
+        help="Run validation every N samples processed.",
+    )
+
+    # Output
+    parser.add_argument("--output_dir", type=str, default="outputs_vae")
+    parser.add_argument(
+        "--save_every",
+        type=int,
+        default=125_000,
+        help="Save checkpoint every N samples processed.",
+    )
+    parser.add_argument(
+        "--log_every",
+        type=int,
+        default=800,
+        help="Log training metrics every N samples processed.",
+    )
+    parser.add_argument("--progress", action="store_true")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Log per-epoch data vs compute timing on main process.",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision="bf16",
+    )
+    set_seed(args.seed)
+
+    output_dir = Path(args.output_dir)
+    if accelerator.is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    stats_path = (
+        Path(args.stats_path)
+        if args.stats_path is not None
+        else output_dir / "vae_stats.json"
+    )
+
+    if stats_path.exists() and not args.recompute_stats:
+        if accelerator.is_main_process:
+            logger.info(f"Loading stats from {stats_path}")
+    else:
+        logger.info("Computing global mean/std (distributed streaming)")
+        stats_dataset = JointDensitySuscDataset(args.zarr_path)
+        stats = compute_streaming_stats_ddp(
+            stats_dataset, args.stats_batch_size, args.num_workers, accelerator
+        )
+        if accelerator.is_main_process:
+            save_stats(stats_path, stats)
+            logger.info(f"Saved stats to {stats_path}")
+
+    accelerator.wait_for_everyone()
+    stats = load_stats(stats_path)
+
+    mean = stats["mean"].float().view(1, 2, 1, 1, 1)
+    std = stats["std"].float().view(1, 2, 1, 1, 1)
+
+    dataset = JointDensitySuscDataset(args.zarr_path)
+    dataset_size = len(dataset)
+    train_size = int(0.98 * dataset_size)
+    val_size = int(0.005 * dataset_size)
+    test_size = dataset_size - train_size - val_size
+
+    train_subset = Subset(dataset, range(0, train_size))
+    val_subset = Subset(dataset, range(train_size, train_size + val_size))
+    test_subset = Subset(
+        dataset,
+        range(train_size + val_size, dataset_size),
+    )
+
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_subset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+    if accelerator.is_main_process:
+        logger.info(
+            "Dataset split sizes - train: %d | val: %d | test: %d",
+            train_size,
+            val_size,
+            test_size,
+        )
+
+    latent_channels = (
+        args.latent_channels if args.latent_channels is not None else args.base_channels
+    )
+    model_cfg = VAE3DConfig(
+        in_channels=2,
+        base_channels=args.base_channels,
+        latent_channels=latent_channels,
+        downsample_factor=args.downsample_factor,
+        blocks_per_stage=args.blocks_per_stage,
+    )
+    model = VAE3D(model_cfg)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    model, optimizer, train_loader, val_loader, test_loader = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, test_loader
+    )
+
+    # Print number of parameters
+    if accelerator.is_main_process:
+        logger.info(
+            f"Number of parameters: {sum(p.numel() for p in model.parameters()):,}"
+        )
+
+    mean = mean.to(accelerator.device)
+    std = std.to(accelerator.device)
+
+    wandb_run = None
+    if accelerator.is_main_process:
+        init_kwargs = {
+            "project": os.getenv("WANDB_PROJECT", "maggrav-vae"),
+            "config": {
+                **vars(args),
+                "train_size": train_size,
+                "val_size": val_size,
+                "test_size": test_size,
+            },
+        }
+        run_name = os.getenv("WANDB_RUN_NAME")
+        if run_name:
+            init_kwargs["name"] = run_name
+        wandb_run = wandb.init(**init_kwargs)
+
+    if accelerator.is_main_process:
+        logger.info("Training for %d samples", args.max_steps)
+
+    global_samples = 0
+    best_val_loss = float("inf")
+    best_path = output_dir / "vae_best.json"
+    log_samples = 0
+    log_total_sum = 0.0
+    log_recon_sum = 0.0
+    log_kl_sum = 0.0
+    eval_samples = 0
+    eval_total_sum = 0.0
+    eval_recon_sum = 0.0
+    eval_kl_sum = 0.0
+
+    next_log = args.log_every
+    next_eval = args.eval_every_steps
+    next_save = args.save_every
+    last_saved_step = 0
+
+    epoch = 0
+    data_iter = iter(train_loader)
+    progress_bar = None
+    if args.progress and accelerator.is_local_main_process:
+        progress_bar = tqdm(total=args.max_steps, desc="Training", leave=True)
+
+    profile_window = args.profile and accelerator.is_main_process
+    window_data_time = 0.0
+    window_compute_time = 0.0
+    window_steps = 0
+    window_start = time.perf_counter() if profile_window else None
+
+    while global_samples < args.max_steps:
+        if profile_window:
+            batch_wait_start = time.perf_counter()
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            epoch += 1
+            data_iter = iter(train_loader)
+            continue
+        if profile_window:
+            window_data_time += time.perf_counter() - batch_wait_start
+            compute_start = time.perf_counter()
+
+        model.train()
+        with accelerator.accumulate(model):
+            batch = batch.to(accelerator.device, non_blocking=True)
+            batch = (batch - mean) / std
+
+            with accelerator.autocast():
+                recon, mu, logvar = model(batch)
+                recon_loss = F.mse_loss(recon, batch)
+                kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                loss = recon_loss + args.kl_weight * kl_loss
+
+            accelerator.backward(loss)
+            if accelerator.sync_gradients and args.grad_clip > 0:
+                accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        batch_size = batch.size(0)
+        batch_size_tensor = torch.tensor(batch_size, device=accelerator.device)
+        step_samples = accelerator.reduce(batch_size_tensor, reduction="sum")
+        step_samples_int = int(step_samples.item())
+        global_samples += step_samples_int
+
+        loss_sum = accelerator.reduce(
+            loss.detach() * batch_size_tensor, reduction="sum"
+        )
+        recon_sum = accelerator.reduce(
+            recon_loss.detach() * batch_size_tensor, reduction="sum"
+        )
+        kl_sum = accelerator.reduce(
+            kl_loss.detach() * batch_size_tensor, reduction="sum"
+        )
+
+        log_samples += step_samples_int
+        log_total_sum += loss_sum.item()
+        log_recon_sum += recon_sum.item()
+        log_kl_sum += kl_sum.item()
+
+        eval_samples += step_samples_int
+        eval_total_sum += loss_sum.item()
+        eval_recon_sum += recon_sum.item()
+        eval_kl_sum += kl_sum.item()
+
+        if progress_bar is not None:
+            progress_bar.update(step_samples_int)
+        window_steps += 1
+
+        if global_samples >= next_log:
+            if profile_window and window_start is not None and window_steps > 0:
+                window_duration = time.perf_counter() - window_start
+                data_pct = (
+                    (window_data_time / window_duration) * 100.0
+                    if window_duration > 0
+                    else 0.0
+                )
+                compute_pct = (
+                    (window_compute_time / window_duration) * 100.0
+                    if window_duration > 0
+                    else 0.0
+                )
+                logger.info(
+                    "Profile window: loop=%.3fs | data=%.3fs (%.1f%%) | compute=%.3fs (%.1f%%) | steps=%d",
+                    window_duration,
+                    window_data_time,
+                    data_pct,
+                    window_compute_time,
+                    compute_pct,
+                    window_steps,
+                )
+                window_data_time = 0.0
+                window_compute_time = 0.0
+                window_steps = 0
+                window_start = time.perf_counter()
+            if log_samples > 0 and accelerator.is_main_process:
+                logger.info(
+                    "Samples %d | Train Loss %.6f | Recon %.6f | KL %.6f",
+                    global_samples,
+                    log_total_sum / log_samples,
+                    log_recon_sum / log_samples,
+                    log_kl_sum / log_samples,
+                )
+            if wandb_run is not None and log_samples > 0:
+                wandb.log(
+                    {
+                        "train/recon_loss": log_recon_sum / log_samples,
+                        "train/kl_loss": log_kl_sum / log_samples,
+                        "train/total_loss": log_total_sum / log_samples,
+                    },
+                    step=global_samples,
+                )
+            log_samples = 0
+            log_total_sum = 0.0
+            log_recon_sum = 0.0
+            log_kl_sum = 0.0
+            next_log += args.log_every
+        if profile_window:
+            window_compute_time += time.perf_counter() - compute_start
+
+        if global_samples >= next_eval:
+            val_metrics = evaluate(
+                model, val_loader, mean, std, args.kl_weight, accelerator
+            )
+            if accelerator.is_main_process:
+                if val_metrics["total_loss"] < best_val_loss:
+                    best_val_loss = val_metrics["total_loss"]
+                    payload = {
+                        "best_val_loss": best_val_loss,
+                        "global_samples": global_samples,
+                        "checkpoint": f"vae_checkpoint_step_{global_samples}.pt",
+                    }
+                    with best_path.open("w") as f:
+                        json.dump(payload, f, indent=2)
+                    logger.info("Updated best checkpoint: %s", best_path)
+                if eval_samples > 0:
+                    logger.info(
+                        "Samples %d | Train Loss %.6f | Recon %.6f | KL %.6f",
+                        global_samples,
+                        eval_total_sum / eval_samples,
+                        eval_recon_sum / eval_samples,
+                        eval_kl_sum / eval_samples,
+                    )
+                logger.info(
+                    "Samples %d | Val Loss %.6f | Recon %.6f | KL %.6f",
+                    global_samples,
+                    val_metrics["total_loss"],
+                    val_metrics["recon_loss"],
+                    val_metrics["kl_loss"],
+                )
+            if wandb_run is not None:
+                payload = {
+                    "val/recon_loss": val_metrics["recon_loss"],
+                    "val/kl_loss": val_metrics["kl_loss"],
+                    "val/total_loss": val_metrics["total_loss"],
+                }
+                if eval_samples > 0:
+                    payload.update(
+                        {
+                            "train/recon_loss": eval_recon_sum / eval_samples,
+                            "train/kl_loss": eval_kl_sum / eval_samples,
+                            "train/total_loss": eval_total_sum / eval_samples,
+                        }
+                    )
+                wandb.log(payload, step=global_samples)
+
+            eval_samples = 0
+            eval_total_sum = 0.0
+            eval_recon_sum = 0.0
+            eval_kl_sum = 0.0
+            next_eval += args.eval_every_steps
+
+        if global_samples >= next_save:
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                unwrapped_model = accelerator.unwrap_model(model)
+                checkpoint = {
+                    "global_samples": global_samples,
+                    "model_state_dict": unwrapped_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "config": model_cfg,
+                    "args": vars(args),
+                    "stats_path": str(stats_path),
+                }
+                checkpoint_path = (
+                    output_dir / f"vae_checkpoint_step_{global_samples}.pt"
+                )
+                torch.save(checkpoint, checkpoint_path)
+                logger.info("Saved checkpoint: %s", checkpoint_path)
+                last_saved_step = global_samples
+            next_save += args.save_every
+
+    if progress_bar is not None:
+        progress_bar.close()
+
+    if profile_window and window_start is not None and window_steps > 0:
+        window_duration = time.perf_counter() - window_start
+        data_pct = (
+            (window_data_time / window_duration) * 100.0 if window_duration > 0 else 0.0
+        )
+        compute_pct = (
+            (window_compute_time / window_duration) * 100.0
+            if window_duration > 0
+            else 0.0
+        )
+        logger.info(
+            "Profile window (partial): loop=%.3fs | data=%.3fs (%.1f%%) | compute=%.3fs (%.1f%%) | steps=%d",
+            window_duration,
+            window_data_time,
+            data_pct,
+            window_compute_time,
+            compute_pct,
+            window_steps,
+        )
+
+    if last_saved_step != global_samples:
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            unwrapped_model = accelerator.unwrap_model(model)
+            checkpoint = {
+                "global_samples": global_samples,
+                "model_state_dict": unwrapped_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "config": model_cfg,
+                "args": vars(args),
+                "stats_path": str(stats_path),
+            }
+            checkpoint_path = output_dir / f"vae_checkpoint_step_{global_samples}.pt"
+            torch.save(checkpoint, checkpoint_path)
+            logger.info("Saved checkpoint: %s", checkpoint_path)
+
+
+if __name__ == "__main__":
+    main()
