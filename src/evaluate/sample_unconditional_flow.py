@@ -13,11 +13,10 @@ the generated latents back to the original latent space before VAE decoding.
 """
 
 import argparse
-import json
 import logging
 import math
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,8 +24,12 @@ import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-from models.unet import UNet3DConfig, UNet3DDiffusion
-from models.vae import VAE3D, VAE3DConfig
+from ..models.flow import sample_rectified_flow
+from ..models.unet import UNet3DConfig, UNet3DDiffusion
+from ..models.vae import VAE3D, VAE3DConfig
+from ..utils.checkpoint import clean_state_dict, load_checkpoint
+from ..utils.masking import create_padding_mask
+from ..utils.stats import load_stats
 
 logging.basicConfig(
     format="%(asctime)s %(message)s",
@@ -34,97 +37,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-
-def _load_checkpoint(checkpoint_path: Path, device: torch.device, config_cls) -> Dict:
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    try:
-        from torch.serialization import safe_globals
-
-        with safe_globals([config_cls]):
-            return torch.load(checkpoint_path, map_location=device)
-    except Exception:
-        return torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-
-def load_stats(stats_path: Path) -> Dict[str, torch.Tensor]:
-    with stats_path.open("r") as f:
-        payload = json.load(f)
-    return {
-        "count": torch.tensor(payload["count"], dtype=torch.float64),
-        "mean": torch.tensor(payload["mean"], dtype=torch.float64),
-        "std": torch.tensor(payload["std"], dtype=torch.float64),
-    }
-
-
-def create_padding_mask(
-    padded_shape: Tuple[int, int, int, int],
-    original_spatial: Tuple[int, int, int],
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Create a mask that is 1 in the valid (original) region and 0 in the padded region.
-    """
-    _, d_pad, h_pad, w_pad = padded_shape
-    d_orig, h_orig, w_orig = original_spatial
-
-    mask = torch.zeros(1, 1, d_pad, h_pad, w_pad, device=device)
-    mask[:, :, :d_orig, :h_orig, :w_orig] = 1.0
-    return mask
-
-
-@torch.no_grad()
-def sample_rectified_flow(
-    model: UNet3DDiffusion,
-    num_samples: int,
-    latent_shape: Tuple[int, int, int, int],
-    num_steps: int,
-    accelerator: Accelerator,
-    mask: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    Basic Euler sampler for rectified flow.
-    Starts from x(t=1) ~ N(0, I) and integrates to t=0.
-
-    If mask is provided, noise is only in the valid region and
-    padded regions stay at zero throughout.
-    """
-    model.eval()
-    channels, depth, height, width = latent_shape
-    device = accelerator.device
-    x = torch.randn(
-        num_samples, channels, depth, height, width, device=device, dtype=torch.float32
-    )
-
-    # Apply mask to initial noise if provided
-    if mask is not None:
-        x = x * mask
-
-    t_vals = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
-    for i in range(num_steps):
-        t = t_vals[i]
-        t_next = t_vals[i + 1]
-        dt = t_next - t
-        t_batch = torch.full((num_samples,), t, device=device)
-        with accelerator.autocast():
-            v = model(x, t_batch)
-        x = x + v * dt
-
-        # Keep padded regions at zero after each step
-        if mask is not None:
-            x = x * mask
-
-    model.train()
-    return x
-
-
-def _clean_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
-        return {
-            key.replace("_orig_mod.", "", 1): val for key, val in state_dict.items()
-        }
-    return state_dict
 
 
 def _plot_sample_slices(
@@ -221,10 +133,10 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = accelerator.device
-    diffusion_ckpt = _load_checkpoint(Path(args.checkpoint), device, UNet3DConfig)
+    diffusion_ckpt = load_checkpoint(Path(args.checkpoint), device, [UNet3DConfig])
     diffusion_cfg = diffusion_ckpt["config"]
     diffusion = UNet3DDiffusion(diffusion_cfg)
-    diffusion_state = _clean_state_dict(diffusion_ckpt["model_state_dict"])
+    diffusion_state = clean_state_dict(diffusion_ckpt["model_state_dict"])
     diffusion.load_state_dict(diffusion_state)
     diffusion.to(device)
 
@@ -339,8 +251,9 @@ def main() -> None:
                     num_samples=batch,
                     latent_shape=latent_shape,
                     num_steps=args.num_steps,
-                    accelerator=accelerator,
+                    device=device,
                     mask=padding_mask,
+                    autocast_context=accelerator.autocast(),
                 )
             # Denormalize latents back to original latent space
             if latent_mean is not None and latent_std is not None:
@@ -366,10 +279,10 @@ def main() -> None:
         logger.info("Decoding latents with VAE on %s.", decode_device)
 
     if has_work:
-        vae_ckpt = _load_checkpoint(Path(args.vae_checkpoint), device, VAE3DConfig)
+        vae_ckpt = load_checkpoint(Path(args.vae_checkpoint), device, [VAE3DConfig])
         vae_cfg = vae_ckpt["config"]
         vae = VAE3D(vae_cfg)
-        vae_state = _clean_state_dict(vae_ckpt["model_state_dict"])
+        vae_state = clean_state_dict(vae_ckpt["model_state_dict"])
         vae.load_state_dict(vae_state)
         vae.eval()
         vae.to(decode_device)
@@ -390,6 +303,8 @@ def main() -> None:
                     decoded = vae.decode(latents)
                 # Denormalize VAE output back to original data space
                 decoded = decoded * vae_std + vae_mean
+                # Apply inverse log10 transformation to susceptibility channel (channel 1)
+                decoded[:, 1:2] = torch.pow(10.0, decoded[:, 1:2]) - 1e-6
 
             decoded_np = decoded.detach().cpu().float().numpy()
             for i in range(batch):

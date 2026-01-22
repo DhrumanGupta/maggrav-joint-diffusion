@@ -6,7 +6,6 @@ Usage:
 """
 
 import argparse
-import json
 import logging
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -16,11 +15,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
-from models.vae import VAE3D, VAE3DConfig
-from data.zarr_dataset import NoddyverseZarrDataset
+from ..models.vae import VAE3D, VAE3DConfig
+from ..utils.checkpoint import clean_state_dict, load_checkpoint
+from ..utils.datasets import JointDensitySuscDataset
+from ..utils.stats import load_stats
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -31,35 +32,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-
-class JointDensitySuscDataset(Dataset):
-    def __init__(self, zarr_path: str):
-        self.base = NoddyverseZarrDataset(
-            zarr_path,
-            fields=("rock_types",),
-            include_metadata=False,
-            return_tensors=True,
-        )
-
-    def __len__(self) -> int:
-        return len(self.base)
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        sample = self.base[idx]
-        density = sample["density"]
-        susceptibility = sample["susceptibility"]
-        return torch.stack([density, susceptibility], dim=0)
-
-
-def load_stats(stats_path: Path) -> Dict[str, torch.Tensor]:
-    with stats_path.open("r") as f:
-        payload = json.load(f)
-    return {
-        "count": torch.tensor(payload["count"], dtype=torch.float64),
-        "mean": torch.tensor(payload["mean"], dtype=torch.float64),
-        "std": torch.tensor(payload["std"], dtype=torch.float64),
-    }
 
 
 def _plot_recon_slices(
@@ -137,18 +109,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_checkpoint(checkpoint_path: Path, device: torch.device) -> Dict[str, object]:
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    try:
-        from torch.serialization import safe_globals
-
-        with safe_globals([VAE3DConfig]):
-            return torch.load(checkpoint_path, map_location=device)
-    except Exception:
-        return torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-
 @torch.no_grad()
 def evaluate(
     model: torch.nn.Module,
@@ -220,7 +180,7 @@ def main() -> None:
     device = accelerator.device
 
     checkpoint_path = Path(args.checkpoint)
-    checkpoint = _load_checkpoint(checkpoint_path, device)
+    checkpoint = load_checkpoint(checkpoint_path, device, [VAE3DConfig])
 
     stats_path = (
         Path(args.stats_path)
@@ -239,11 +199,7 @@ def main() -> None:
 
     model_cfg = checkpoint["config"]
     model = VAE3D(model_cfg)
-    state_dict = checkpoint["model_state_dict"]
-    if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
-        state_dict = {
-            key.replace("_orig_mod.", "", 1): val for key, val in state_dict.items()
-        }
+    state_dict = clean_state_dict(checkpoint["model_state_dict"])
     model.load_state_dict(state_dict)
     model.to(device)
 
@@ -310,6 +266,8 @@ def main() -> None:
                     with accelerator.autocast():
                         recon, _, _ = model(sample_norm)
                 recon_denorm = recon * std + mean
+                # Apply inverse log10 transformation to susceptibility channel (channel 1)
+                recon_denorm[:, 1:2] = torch.pow(10.0, recon_denorm[:, 1:2]) - 1e-6
                 depth = sample.shape[2]
                 z_max = min(200, depth - 1)
                 z_indices = list(range(0, z_max + 1, 10))

@@ -13,21 +13,23 @@ the generated latents back to the original latent space before VAE decoding.
 """
 
 import argparse
-import json
 import logging
 import math
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn as nn
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-from models.unet import UNet3DConfig, UNet3DDiffusion
-from models.vae import VAE3D, VAE3DConfig
+from ..models.edm import EDMPrecond, sample_edm_heun
+from ..models.unet import UNet3DConfig, UNet3DDiffusion
+from ..models.vae import VAE3D, VAE3DConfig
+from ..utils.checkpoint import clean_state_dict, load_checkpoint
+from ..utils.masking import create_padding_mask
+from ..utils.stats import load_stats
 
 logging.basicConfig(
     format="%(asctime)s %(message)s",
@@ -35,208 +37,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-
-# -------------------------
-# EDM Preconditioning
-# -------------------------
-
-
-class EDMPrecond(nn.Module):
-    """
-    EDM preconditioning wrapper for the UNet.
-
-    Implements the preconditioning from "Elucidating the Design Space of
-    Diffusion-Based Generative Models" (Karras et al., 2022).
-
-    The raw network F_θ is wrapped with input/output scaling:
-        D_θ(x; σ) = c_skip(σ) * x + c_out(σ) * F_θ(c_in(σ) * x; c_noise(σ))
-
-    where:
-        c_skip(σ) = σ_data² / (σ² + σ_data²)
-        c_out(σ) = σ * σ_data / sqrt(σ² + σ_data²)
-        c_in(σ) = 1 / sqrt(σ² + σ_data²)
-        c_noise(σ) = ln(σ) / 4
-    """
-
-    def __init__(self, model: UNet3DDiffusion, sigma_data: float = 0.5):
-        super().__init__()
-        self.model = model
-        self.sigma_data = sigma_data
-
-    def forward(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Noisy input tensor (B, C, D, H, W)
-            sigma: Noise levels (B,) - can be any positive value
-
-        Returns:
-            Denoised estimate (B, C, D, H, W)
-        """
-        sigma = sigma.view(-1, 1, 1, 1, 1)  # (B, 1, 1, 1, 1) for broadcasting
-        sigma_data = self.sigma_data
-
-        # Preconditioning coefficients
-        c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
-        c_out = sigma * sigma_data / (sigma**2 + sigma_data**2).sqrt()
-        c_in = 1 / (sigma**2 + sigma_data**2).sqrt()
-        c_noise = sigma.view(-1).log() / 4  # (B,) for time embedding
-
-        # Apply preconditioning
-        scaled_input = c_in * x
-        F_out = self.model(scaled_input, c_noise)
-        denoised = c_skip * x + c_out * F_out
-
-        return denoised
-
-
-# -------------------------
-# Helper Functions
-# -------------------------
-
-
-def _load_checkpoint(checkpoint_path: Path, device: torch.device, config_cls) -> Dict:
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    try:
-        from torch.serialization import safe_globals
-
-        with safe_globals([config_cls]):
-            return torch.load(checkpoint_path, map_location=device)
-    except Exception:
-        return torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-
-def load_stats(stats_path: Path) -> Dict[str, torch.Tensor]:
-    with stats_path.open("r") as f:
-        payload = json.load(f)
-    return {
-        "count": torch.tensor(payload["count"], dtype=torch.float64),
-        "mean": torch.tensor(payload["mean"], dtype=torch.float64),
-        "std": torch.tensor(payload["std"], dtype=torch.float64),
-    }
-
-
-def create_padding_mask(
-    padded_shape: Tuple[int, int, int, int],
-    original_spatial: Tuple[int, int, int],
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Create a mask that is 1 in the valid (original) region and 0 in the padded region.
-    """
-    _, d_pad, h_pad, w_pad = padded_shape
-    d_orig, h_orig, w_orig = original_spatial
-
-    mask = torch.zeros(1, 1, d_pad, h_pad, w_pad, device=device)
-    mask[:, :, :d_orig, :h_orig, :w_orig] = 1.0
-    return mask
-
-
-def _clean_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
-        return {
-            key.replace("_orig_mod.", "", 1): val for key, val in state_dict.items()
-        }
-    return state_dict
-
-
-# -------------------------
-# EDM Sampling
-# -------------------------
-
-
-def get_karras_sigmas(
-    num_steps: int,
-    sigma_min: float = 0.002,
-    sigma_max: float = 80.0,
-    rho: float = 7.0,
-    device: torch.device = torch.device("cpu"),
-) -> torch.Tensor:
-    """
-    Generate Karras et al. noise schedule for EDM sampling.
-
-    σ_i = (σ_max^(1/ρ) + i/(n-1) * (σ_min^(1/ρ) - σ_max^(1/ρ)))^ρ
-
-    Returns sigma values from sigma_max to sigma_min (plus final 0).
-    """
-    ramp = torch.linspace(0, 1, num_steps, device=device)
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
-    # Append 0 at the end for the final step
-    sigmas = torch.cat([sigmas, torch.zeros(1, device=device)])
-    return sigmas
-
-
-@torch.no_grad()
-def sample_edm_heun(
-    model: EDMPrecond,
-    num_samples: int,
-    latent_shape: Tuple[int, int, int, int],
-    num_steps: int,
-    accelerator: Accelerator,
-    sigma_min: float = 0.002,
-    sigma_max: float = 80.0,
-    rho: float = 7.0,
-    mask: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    Heun's 2nd-order deterministic sampler for EDM.
-
-    Starts from x ~ N(0, σ_max²) and integrates to σ_min using the
-    probability flow ODE with Heun's method (predictor-corrector).
-
-    If mask is provided, noise is only in the valid region and
-    padded regions stay at zero throughout.
-    """
-    model.eval()
-    channels, depth, height, width = latent_shape
-    device = accelerator.device
-
-    # Get sigma schedule
-    sigmas = get_karras_sigmas(num_steps, sigma_min, sigma_max, rho, device)
-
-    # Initialize from N(0, σ_max²)
-    x = torch.randn(num_samples, channels, depth, height, width, device=device)
-    x = x * sigmas[0]  # Scale by σ_max
-
-    # Apply mask to initial noise if provided
-    if mask is not None:
-        x = x * mask
-
-    for i in range(len(sigmas) - 1):
-        sigma_cur = sigmas[i]
-        sigma_next = sigmas[i + 1]
-
-        # Get denoised estimate at current sigma
-        sigma_batch = sigma_cur.expand(num_samples)
-        with accelerator.autocast():
-            denoised = model(x, sigma_batch)
-
-        # Derivative: d = (x - D(x, σ)) / σ
-        d_cur = (x - denoised) / sigma_cur
-
-        # Euler step (predictor)
-        x_next = x + (sigma_next - sigma_cur) * d_cur
-
-        # Heun correction (if not at final step)
-        if sigma_next > 0:
-            sigma_batch_next = sigma_next.expand(num_samples)
-            with accelerator.autocast():
-                denoised_next = model(x_next, sigma_batch_next)
-            d_next = (x_next - denoised_next) / sigma_next
-            # Average the derivatives
-            x_next = x + (sigma_next - sigma_cur) * (d_cur + d_next) / 2
-
-        x = x_next
-
-        # Keep padded regions at zero after each step
-        if mask is not None:
-            x = x * mask
-
-    model.train()
-    return x
 
 
 # -------------------------
@@ -367,7 +167,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = accelerator.device
-    edm_ckpt = _load_checkpoint(Path(args.checkpoint), device, UNet3DConfig)
+    edm_ckpt = load_checkpoint(Path(args.checkpoint), device, [UNet3DConfig])
     edm_cfg = edm_ckpt["config"]
 
     # Get sigma_data from checkpoint (default 1.0 for normalized latents)
@@ -378,7 +178,7 @@ def main() -> None:
     # Create EDMPrecond-wrapped model
     raw_model = UNet3DDiffusion(edm_cfg)
     edm_model = EDMPrecond(raw_model, sigma_data=sigma_data)
-    edm_state = _clean_state_dict(edm_ckpt["model_state_dict"])
+    edm_state = clean_state_dict(edm_ckpt["model_state_dict"])
     edm_model.load_state_dict(edm_state)
     edm_model.to(device)
 
@@ -499,11 +299,12 @@ def main() -> None:
                     num_samples=batch,
                     latent_shape=latent_shape,
                     num_steps=args.num_steps,
-                    accelerator=accelerator,
+                    device=device,
                     sigma_min=args.sigma_min,
                     sigma_max=args.sigma_max,
                     rho=args.rho,
                     mask=padding_mask,
+                    autocast_context=accelerator.autocast(),
                 )
             # Denormalize latents back to original latent space
             if latent_mean is not None and latent_std is not None:
@@ -529,10 +330,10 @@ def main() -> None:
         logger.info("Decoding latents with VAE on %s.", decode_device)
 
     if has_work:
-        vae_ckpt = _load_checkpoint(Path(args.vae_checkpoint), device, VAE3DConfig)
+        vae_ckpt = load_checkpoint(Path(args.vae_checkpoint), device, [VAE3DConfig])
         vae_cfg = vae_ckpt["config"]
         vae = VAE3D(vae_cfg)
-        vae_state = _clean_state_dict(vae_ckpt["model_state_dict"])
+        vae_state = clean_state_dict(vae_ckpt["model_state_dict"])
         vae.load_state_dict(vae_state)
         vae.eval()
         vae.to(decode_device)
@@ -553,6 +354,8 @@ def main() -> None:
                     decoded = vae.decode(latents)
                 # Denormalize VAE output back to original data space
                 decoded = decoded * vae_std + vae_mean
+                # Apply inverse log10 transformation to susceptibility channel (channel 1)
+                decoded[:, 1:2] = torch.pow(10.0, decoded[:, 1:2]) - 1e-6
 
             decoded_np = decoded.detach().cpu().float().numpy()
             for i in range(batch):

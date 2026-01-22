@@ -4,8 +4,8 @@
 zarr_path: /scratch/dhruman_gupta/noddyverse_preprocessed/output-final
 stats_path: null
 recompute_stats: false
-num_workers: 8
-stats_batch_size: 8
+num_workers: 16
+stats_batch_size: 64
 
 # Model
 # Note: downsample_factor controls latent spatial size; must be compatible with your input size.

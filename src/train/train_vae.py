@@ -19,13 +19,13 @@ import torch.nn.functional as F
 import yaml
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
 import wandb
-from data.stats_utils import compute_streaming_stats_ddp, load_stats, save_stats
-from models.vae import VAE3D, VAE3DConfig
-from data.zarr_dataset import NoddyverseZarrDataset
+from ..data.stats_utils import compute_streaming_stats_ddp, load_stats, save_stats
+from ..models.vae import VAE3D, VAE3DConfig
+from ..utils.datasets import JointDensitySuscDataset
 
 logging.basicConfig(
     format="%(asctime)s %(message)s",
@@ -33,25 +33,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-
-class JointDensitySuscDataset(Dataset):
-    def __init__(self, zarr_path: str):
-        self.base = NoddyverseZarrDataset(
-            zarr_path,
-            fields=("rock_types",),
-            include_metadata=False,
-            return_tensors=True,
-        )
-
-    def __len__(self) -> int:
-        return len(self.base)
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        sample = self.base[idx]
-        density = sample["density"]
-        susceptibility = sample["susceptibility"]
-        return torch.stack([density, susceptibility], dim=0)
 
 
 @torch.no_grad()

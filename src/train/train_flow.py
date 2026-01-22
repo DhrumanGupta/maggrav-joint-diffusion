@@ -17,24 +17,25 @@ import argparse
 import logging
 import math
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
 import yaml
-import zarr
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from diffusers.training_utils import EMAModel
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 import wandb
-from data.stats_utils import compute_latent_stats_ddp, load_stats, save_stats
-from models.unet import UNet3DConfig, UNet3DDiffusion
+from ..data.stats_utils import compute_latent_stats_ddp, load_stats, save_stats
+from ..models.flow import rectified_flow_loss, sample_rectified_flow
+from ..models.unet import UNet3DConfig, UNet3DDiffusion
+from ..utils.datasets import LatentZarrDataset
+from ..utils.masking import create_padding_mask
 
 logging.basicConfig(
     format="%(asctime)s %(message)s",
@@ -42,198 +43,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-
-class LatentZarrDataset(Dataset):
-    """Dataset that samples latents from a Zarr store on each access."""
-
-    def __init__(self, zarr_path: str, pad_to: int = 32, use_logvar: bool = True):
-        self.zarr_path = zarr_path
-        self.pad_to = max(pad_to, 1)
-
-        group = zarr.open_group(zarr_path, mode="r")
-        if "latent_mu" not in group:
-            raise ValueError(f"Zarr store missing 'latent_mu': {zarr_path}")
-
-        mu_store = group["latent_mu"]
-        self.length = mu_store.shape[0]
-        self.channels = mu_store.shape[1]
-        self.original_spatial = mu_store.shape[2:]
-        self.padded_spatial = self._compute_padded_spatial(self.original_spatial)
-        self.pad_amounts = tuple(
-            padded - orig
-            for padded, orig in zip(self.padded_spatial, self.original_spatial)
-        )
-        self.latent_shape = (self.channels,) + self.padded_spatial
-        self.has_logvar = "latent_logvar" in group
-        self.use_logvar = use_logvar and self.has_logvar
-
-        if use_logvar and not self.has_logvar:
-            logger.warning(
-                "Latent logvar not found in %s; sampling deterministically from mu.",
-                zarr_path,
-            )
-
-        self._group: Optional[zarr.Group] = None
-        self._mu_store: Optional[zarr.Array] = None
-        self._logvar_store: Optional[zarr.Array] = None
-
-    def _compute_padded_spatial(
-        self, spatial: Tuple[int, int, int]
-    ) -> Tuple[int, int, int]:
-        pad_to = self.pad_to
-        return tuple(max(dim, pad_to) for dim in spatial)
-
-    def _ensure_open(self) -> None:
-        if self._group is None:
-            group = zarr.open_group(self.zarr_path, mode="r")
-            self._group = group
-            self._mu_store = group["latent_mu"]
-            self._logvar_store = (
-                group["latent_logvar"] if "latent_logvar" in group else None
-            )
-
-    def __len__(self) -> int:
-        return self.length
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        self._ensure_open()
-        if self._mu_store is None:
-            raise RuntimeError("Latent Zarr store not initialized.")
-
-        mu = torch.as_tensor(self._mu_store[idx], dtype=torch.float32)
-        if self.use_logvar and self._logvar_store is not None:
-            logvar = torch.as_tensor(self._logvar_store[idx], dtype=torch.float32)
-            # Add noise only to original (non-padded) region
-            eps = torch.randn_like(mu)
-            sample = mu + torch.exp(0.5 * logvar) * eps
-            # Pad after sampling so padded regions are strictly zero
-            return self._pad_tensor(sample)
-        # No logvar: just pad mu (padded regions will be zero)
-        return self._pad_tensor(mu)
-
-    def _pad_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
-        pad_d, pad_h, pad_w = self.pad_amounts
-        if pad_d == pad_h == pad_w == 0:
-            return tensor
-        return F.pad(tensor, (0, pad_w, 0, pad_h, 0, pad_d))
-
-
-def create_padding_mask(
-    padded_shape: Tuple[int, int, int, int],
-    original_spatial: Tuple[int, int, int],
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Create a mask that is 1 in the valid (original) region and 0 in the padded region.
-
-    Args:
-        padded_shape: (C, D, H, W) - the padded tensor shape
-        original_spatial: (D, H, W) - the original spatial dimensions before padding
-        device: torch device
-
-    Returns:
-        Mask tensor of shape (1, 1, D, H, W) broadcastable to (B, C, D, H, W)
-    """
-    _, d_pad, h_pad, w_pad = padded_shape
-    d_orig, h_orig, w_orig = original_spatial
-
-    mask = torch.zeros(1, 1, d_pad, h_pad, w_pad, device=device)
-    mask[:, :, :d_orig, :h_orig, :w_orig] = 1.0
-    return mask
-
-
-def rectified_flow_loss(
-    model: UNet3DDiffusion,
-    x: torch.Tensor,
-    mask: Optional[torch.Tensor] = None,
-    logit_mean: float = 0.0,
-    logit_std: float = 1.0,
-) -> torch.Tensor:
-    """
-    Rectified flow loss with logit-normal timestep sampling.
-
-    Logit-normal biases sampling toward middle timesteps (t ~ 0.5),
-    which are harder to predict and more informative for training.
-    This follows the approach used in Stable Diffusion 3.
-
-    x_t = (1 - t) * x + t * z0
-    v = z0 - x
-    loss = MSE(model(x_t, t), v)
-
-    If mask is provided, noise is only added to the valid region and
-    loss is only computed on the valid region.
-    """
-    batch_size = x.shape[0]
-
-    # Logit-normal sampling: sample from normal, then apply sigmoid
-    u = torch.randn(batch_size, device=x.device) * logit_std + logit_mean
-    t = torch.sigmoid(u)  # t in (0, 1), concentrated around 0.5
-
-    z0 = torch.randn_like(x)
-
-    # If mask is provided, zero out noise in padded regions
-    if mask is not None:
-        z0 = z0 * mask
-
-    t_bc = t[:, None, None, None, None]
-    x_t = (1 - t_bc) * x + t_bc * z0
-    v = z0 - x
-    v_pred = model(x_t, t)
-
-    # Compute loss only on valid (non-padded) regions
-    if mask is not None:
-        # Masked MSE loss: average over valid elements only
-        diff_sq = (v_pred - v) ** 2
-        masked_diff_sq = diff_sq * mask
-        loss = masked_diff_sq.sum() / mask.sum() / x.shape[1]  # normalize by channels
-    else:
-        loss = F.mse_loss(v_pred, v)
-
-    return loss
-
-
-@torch.no_grad()
-def sample_rectified_flow(
-    model: UNet3DDiffusion,
-    num_samples: int,
-    latent_shape: Tuple[int, int, int, int],
-    num_steps: int,
-    device: torch.device,
-    mask: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    Basic Euler sampler for rectified flow.
-    Starts from x(t=1) ~ N(0, I) and integrates to t=0.
-
-    If mask is provided, noise is only in the valid region and
-    padded regions stay at zero throughout.
-    """
-    model.eval()
-    channels, depth, height, width = latent_shape
-    x = torch.randn(
-        num_samples, channels, depth, height, width, device=device, dtype=torch.float32
-    )
-
-    # Apply mask to initial noise if provided
-    if mask is not None:
-        x = x * mask
-
-    t_vals = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
-    for i in range(num_steps):
-        t = t_vals[i]
-        t_next = t_vals[i + 1]
-        dt = t_next - t
-        t_batch = torch.full((num_samples,), t, device=device)
-        v = model(x, t_batch)
-        x = x + v * dt
-
-        # Keep padded regions at zero after each step
-        if mask is not None:
-            x = x * mask
-
-    model.train()
-    return x
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
