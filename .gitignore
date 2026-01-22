@@ -8,5 +8,5 @@ data_dir
 *.zarr
 
 wandb
-outputs
+outputs*
 logs

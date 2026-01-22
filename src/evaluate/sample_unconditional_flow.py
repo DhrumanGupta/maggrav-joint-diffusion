@@ -2,11 +2,14 @@
 Sample unconditional volumes from a diffusion checkpoint and decode with a VAE.
 
 Usage:
-    python src/sample_unconditional.py \
+    python src/sample_unconditional_flow.py \
         --checkpoint outputs_diffusion/diffusion_checkpoint_step_1000000.pt \
         --vae_checkpoint outputs_vae/vae_checkpoint_step_1000000.pt \
         --num_samples 4 \
-        --stats_path vae_stats.json
+        --vae_stats_path vae_stats.json
+
+The diffusion checkpoint should contain latent_mean and latent_std for denormalizing
+the generated latents back to the original latent space before VAE decoding.
 """
 
 import argparse
@@ -14,7 +17,7 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -22,8 +25,8 @@ import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-from unet import UNet3DConfig, UNet3DDiffusion
-from vae import VAE3D, VAE3DConfig
+from models.unet import UNet3DConfig, UNet3DDiffusion
+from models.vae import VAE3D, VAE3DConfig
 
 logging.basicConfig(
     format="%(asctime)s %(message)s",
@@ -55,6 +58,22 @@ def load_stats(stats_path: Path) -> Dict[str, torch.Tensor]:
     }
 
 
+def create_padding_mask(
+    padded_shape: Tuple[int, int, int, int],
+    original_spatial: Tuple[int, int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Create a mask that is 1 in the valid (original) region and 0 in the padded region.
+    """
+    _, d_pad, h_pad, w_pad = padded_shape
+    d_orig, h_orig, w_orig = original_spatial
+
+    mask = torch.zeros(1, 1, d_pad, h_pad, w_pad, device=device)
+    mask[:, :, :d_orig, :h_orig, :w_orig] = 1.0
+    return mask
+
+
 @torch.no_grad()
 def sample_rectified_flow(
     model: UNet3DDiffusion,
@@ -62,10 +81,14 @@ def sample_rectified_flow(
     latent_shape: Tuple[int, int, int, int],
     num_steps: int,
     accelerator: Accelerator,
+    mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Basic Euler sampler for rectified flow.
     Starts from x(t=1) ~ N(0, I) and integrates to t=0.
+
+    If mask is provided, noise is only in the valid region and
+    padded regions stay at zero throughout.
     """
     model.eval()
     channels, depth, height, width = latent_shape
@@ -73,6 +96,11 @@ def sample_rectified_flow(
     x = torch.randn(
         num_samples, channels, depth, height, width, device=device, dtype=torch.float32
     )
+
+    # Apply mask to initial noise if provided
+    if mask is not None:
+        x = x * mask
+
     t_vals = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
     for i in range(num_steps):
         t = t_vals[i]
@@ -82,6 +110,11 @@ def sample_rectified_flow(
         with accelerator.autocast():
             v = model(x, t_batch)
         x = x + v * dt
+
+        # Keep padded regions at zero after each step
+        if mask is not None:
+            x = x * mask
+
     model.train()
     return x
 
@@ -137,7 +170,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--vae_checkpoint", type=str, required=True)
-    parser.add_argument("--stats_path", type=str, default="vae_stats.json")
+    parser.add_argument(
+        "--vae_stats_path",
+        type=str,
+        default="vae_stats.json",
+        help="Path to VAE input data stats (density/susceptibility normalization)",
+    )
+    parser.add_argument(
+        "--latent_stats_path",
+        type=str,
+        default=None,
+        help="Path to latent stats JSON (optional, loaded from checkpoint if available)",
+    )
     parser.add_argument("--num_samples", type=int, required=True)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_steps", type=int, default=100)
@@ -184,26 +228,89 @@ def main() -> None:
     diffusion.load_state_dict(diffusion_state)
     diffusion.to(device)
 
-    stats_path = Path(args.stats_path)
-    if not stats_path.exists():
-        raise FileNotFoundError(f"Stats file not found: {stats_path}")
-    stats = load_stats(stats_path)
-    mean_cpu = stats["mean"].float().view(1, 2, 1, 1, 1)
-    std_cpu = stats["std"].float().view(1, 2, 1, 1, 1)
+    # Load VAE stats (for denormalizing decoded outputs)
+    vae_stats_path = Path(args.vae_stats_path)
+    if not vae_stats_path.exists():
+        raise FileNotFoundError(f"VAE stats file not found: {vae_stats_path}")
+    vae_stats = load_stats(vae_stats_path)
+    vae_mean_cpu = vae_stats["mean"].float().view(1, 2, 1, 1, 1)
+    vae_std_cpu = vae_stats["std"].float().view(1, 2, 1, 1, 1)
 
-    latent_shape = (
-        diffusion_cfg.in_channels,
-        diffusion_cfg.input_spatial,
-        diffusion_cfg.input_spatial,
-        diffusion_cfg.input_spatial,
-    )
+    # Load latent stats (for denormalizing sampled latents)
+    # Priority: checkpoint > explicit file > None (no denormalization for old checkpoints)
+    latent_mean = None
+    latent_std = None
+    if "latent_mean" in diffusion_ckpt and "latent_std" in diffusion_ckpt:
+        # Load from checkpoint (preferred)
+        latent_mean = diffusion_ckpt["latent_mean"].float().to(device)
+        latent_std = diffusion_ckpt["latent_std"].float().to(device)
+        if accelerator.is_main_process:
+            logger.info("Loaded latent stats from checkpoint")
+    elif args.latent_stats_path is not None:
+        # Load from explicit file
+        latent_stats_path = Path(args.latent_stats_path)
+        if not latent_stats_path.exists():
+            raise FileNotFoundError(f"Latent stats file not found: {latent_stats_path}")
+        latent_stats = load_stats(latent_stats_path)
+        num_latent_channels = diffusion_cfg.in_channels
+        latent_mean = (
+            latent_stats["mean"]
+            .float()
+            .view(1, num_latent_channels, 1, 1, 1)
+            .to(device)
+        )
+        latent_std = (
+            latent_stats["std"].float().view(1, num_latent_channels, 1, 1, 1).to(device)
+        )
+        if accelerator.is_main_process:
+            logger.info("Loaded latent stats from %s", latent_stats_path)
+    else:
+        if accelerator.is_main_process:
+            logger.warning(
+                "No latent stats found in checkpoint or provided via --latent_stats_path. "
+                "Assuming latents are not normalized (old checkpoint)."
+            )
 
-    z_depth = latent_shape[1]
+    # Get latent shape - prefer from checkpoint, fallback to config
+    if "latent_shape" in diffusion_ckpt:
+        latent_shape = tuple(diffusion_ckpt["latent_shape"])
+    else:
+        latent_shape = (
+            diffusion_cfg.in_channels,
+            diffusion_cfg.input_spatial,
+            diffusion_cfg.input_spatial,
+            diffusion_cfg.input_spatial,
+        )
+
+    # Get original spatial dimensions for cropping and mask
+    if "original_spatial" in diffusion_ckpt:
+        original_spatial = tuple(diffusion_ckpt["original_spatial"])
+    else:
+        # Fallback for older checkpoints - assume no padding
+        original_spatial = latent_shape[1:]
+
+    # Create padding mask if there is padding
+    padding_mask = None
+    if original_spatial != latent_shape[1:]:
+        padding_mask = create_padding_mask(
+            padded_shape=latent_shape,
+            original_spatial=original_spatial,
+            device=device,
+        )
+        if accelerator.is_main_process:
+            logger.info(
+                "Padding mask created: original %s -> padded %s",
+                original_spatial,
+                latent_shape[1:],
+            )
+
+    z_depth = original_spatial[0]  # Use original depth for plotting
     z_max = min(190, z_depth - 1)
     z_indices = list(range(0, z_max + 1, 10))
-    if z_indices[-1] != 190:
-        if accelerator.is_main_process:
-            logger.info("Depth=%d, plotting slices: %s", z_depth, z_indices)
+    if z_indices[-1] != z_max:
+        z_indices.append(z_max)
+    if accelerator.is_main_process:
+        logger.info("Depth=%d, plotting slices: %s", z_depth, z_indices)
 
     channel_names = ("grav", "mag")
     total = args.num_samples
@@ -220,6 +327,9 @@ def main() -> None:
     latent_dir = output_dir / "latents"
     latent_dir.mkdir(parents=True, exist_ok=True)
 
+    # Target shape for cropping (channels, D, H, W)
+    crop_target = (latent_shape[0],) + original_spatial
+
     if has_work:
         while generated < end_idx:
             batch = min(batch_size, end_idx - generated)
@@ -230,8 +340,12 @@ def main() -> None:
                     latent_shape=latent_shape,
                     num_steps=args.num_steps,
                     accelerator=accelerator,
+                    mask=padding_mask,
                 )
-            latents = _crop_latents(latents, (48, 25, 25, 25))
+            # Denormalize latents back to original latent space
+            if latent_mean is not None and latent_std is not None:
+                latents = latents * latent_std + latent_mean
+            latents = _crop_latents(latents, crop_target)
             for i in range(batch):
                 sample_idx = generated + i
                 latent_path = latent_dir / f"latent_{sample_idx:04d}.pt"
@@ -259,8 +373,8 @@ def main() -> None:
         vae.load_state_dict(vae_state)
         vae.eval()
         vae.to(decode_device)
-        mean = mean_cpu.to(decode_device)
-        std = std_cpu.to(decode_device)
+        vae_mean = vae_mean_cpu.to(decode_device)
+        vae_std = vae_std_cpu.to(decode_device)
 
         generated = start_idx
         while generated < end_idx:
@@ -274,7 +388,8 @@ def main() -> None:
             with torch.no_grad():
                 with accelerator.autocast():
                     decoded = vae.decode(latents)
-                decoded = decoded * std + mean
+                # Denormalize VAE output back to original data space
+                decoded = decoded * vae_std + vae_mean
 
             decoded_np = decoded.detach().cpu().float().numpy()
             for i in range(batch):

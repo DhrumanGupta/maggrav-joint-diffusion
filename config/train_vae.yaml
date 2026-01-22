@@ -1,0 +1,50 @@
+# Single source of truth for VAE training (mirrors src/train_diffusion.py style)
+
+# Data
+zarr_path: /scratch/dhruman_gupta/noddyverse_preprocessed/output-final
+stats_path: null
+recompute_stats: false
+num_workers: 8
+stats_batch_size: 8
+
+# Model
+# Note: downsample_factor controls latent spatial size; must be compatible with your input size.
+downsample_factor: 8
+base_channels: 24
+latent_channels: 48
+blocks_per_stage: 2
+
+# Training
+batch_size: 2
+lr: 1.0e-4
+kl_weight: 1.0e-4
+
+# KL warmup (in samples processed): KL weight ramps 0 -> kl_weight over this many samples.
+kl_warmup_steps: 500000
+
+# LR warmup (in samples processed): LR ramps 0 -> lr over this many samples.
+warmup_steps: 250000
+grad_clip: 1.0
+seed: 42
+gradient_accumulation_steps: 1
+
+# Total number of samples to process before stopping.
+max_steps: 10000000
+
+# Run validation every N samples processed.
+eval_every_steps: 250000
+
+# Output
+output_dir: outputs_vae
+
+# Save checkpoint every N samples processed.
+save_every: 250000
+
+# Log training metrics every N samples processed.
+log_every: 800
+
+# Progress bar on local main process.
+progress: false
+
+# Log per-epoch data vs compute timing on main process.
+profile: false

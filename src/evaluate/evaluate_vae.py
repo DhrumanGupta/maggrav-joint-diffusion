@@ -19,8 +19,8 @@ from accelerate import Accelerator
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm.auto import tqdm
 
-from vae import VAE3D, VAE3DConfig
-from zarr_dataset import NoddyverseZarrDataset
+from models.vae import VAE3D, VAE3DConfig
+from data.zarr_dataset import NoddyverseZarrDataset
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt

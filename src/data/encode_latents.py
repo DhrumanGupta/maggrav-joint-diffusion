@@ -23,8 +23,8 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
-from vae import VAE3D, VAE3DConfig
-from zarr_dataset import NoddyverseZarrDataset
+from models.vae import VAE3D, VAE3DConfig
+from data.zarr_dataset import NoddyverseZarrDataset
 
 logging.basicConfig(
     format="%(asctime)s %(message)s",

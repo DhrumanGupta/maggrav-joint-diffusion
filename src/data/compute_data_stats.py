@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm.auto import tqdm
 
-from zarr_dataset import NoddyverseZarrDataset
+from data.zarr_dataset import NoddyverseZarrDataset
 
 # Tell torch to use CPU only.
 torch.set_default_device("cpu")

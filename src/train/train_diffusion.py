@@ -1,24 +1,31 @@
 """
-Train a 3D diffusion model on VAE latents with rectified flow.
+Train a 3D diffusion model on VAE latents with EDM (Elucidating the Design Space
+of Diffusion-Based Generative Models).
 
 Uses Hugging Face Accelerate for multi-GPU training and streams latents from a
 Zarr store created by `encode_latents.py`.
 
 Usage:
-    python src/train_diffusion.py --latents_zarr /path/to/latents.zarr --max_steps 100000
-    accelerate launch src/train_diffusion.py --latents_zarr /path/to/latents.zarr --max_steps 100000
+    python src/train_diffusion.py --config config/train_diffusion_edm.yaml
+    accelerate launch src/train_diffusion.py --config config/train_diffusion_edm.yaml
 """
+
+import warnings
+
+warnings.filterwarnings("ignore", message="Profiler function")
 
 import argparse
 import logging
 import math
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import yaml
 import zarr
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -28,7 +35,8 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 import wandb
-from unet import UNet3DConfig, UNet3DDiffusion
+from data.stats_utils import compute_latent_stats_ddp, load_stats, save_stats
+from models.unet import UNet3DConfig, UNet3DDiffusion
 
 logging.basicConfig(
     format="%(asctime)s %(message)s",
@@ -36,6 +44,64 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+# -------------------------
+# EDM Preconditioning
+# -------------------------
+
+
+class EDMPrecond(nn.Module):
+    """
+    EDM preconditioning wrapper for the UNet.
+
+    Implements the preconditioning from "Elucidating the Design Space of
+    Diffusion-Based Generative Models" (Karras et al., 2022).
+
+    The raw network F_θ is wrapped with input/output scaling:
+        D_θ(x; σ) = c_skip(σ) * x + c_out(σ) * F_θ(c_in(σ) * x; c_noise(σ))
+
+    where:
+        c_skip(σ) = σ_data² / (σ² + σ_data²)
+        c_out(σ) = σ * σ_data / sqrt(σ² + σ_data²)
+        c_in(σ) = 1 / sqrt(σ² + σ_data²)
+        c_noise(σ) = ln(σ) / 4
+    """
+
+    def __init__(self, model: UNet3DDiffusion, sigma_data: float = 0.5):
+        super().__init__()
+        self.model = model
+        self.sigma_data = sigma_data
+
+    def forward(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Noisy input tensor (B, C, D, H, W)
+            sigma: Noise levels (B,) - can be any positive value
+
+        Returns:
+            Denoised estimate (B, C, D, H, W)
+        """
+        sigma = sigma.view(-1, 1, 1, 1, 1)  # (B, 1, 1, 1, 1) for broadcasting
+        sigma_data = self.sigma_data
+
+        # Preconditioning coefficients
+        c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
+        c_out = sigma * sigma_data / (sigma**2 + sigma_data**2).sqrt()
+        c_in = 1 / (sigma**2 + sigma_data**2).sqrt()
+        c_noise = sigma.squeeze().log() / 4  # (B,) for time embedding
+
+        # Apply preconditioning
+        scaled_input = c_in * x
+        F_out = self.model(scaled_input, c_noise)
+        denoised = c_skip * x + c_out * F_out
+
+        return denoised
+
+
+# -------------------------
+# Dataset
+# -------------------------
 
 
 class LatentZarrDataset(Dataset):
@@ -96,13 +162,15 @@ class LatentZarrDataset(Dataset):
             raise RuntimeError("Latent Zarr store not initialized.")
 
         mu = torch.as_tensor(self._mu_store[idx], dtype=torch.float32)
-        mu = self._pad_tensor(mu)
         if self.use_logvar and self._logvar_store is not None:
             logvar = torch.as_tensor(self._logvar_store[idx], dtype=torch.float32)
-            logvar = self._pad_tensor(logvar)
+            # Add noise only to original (non-padded) region
             eps = torch.randn_like(mu)
-            return mu + torch.exp(0.5 * logvar) * eps
-        return mu
+            sample = mu + torch.exp(0.5 * logvar) * eps
+            # Pad after sampling so padded regions are strictly zero
+            return self._pad_tensor(sample)
+        # No logvar: just pad mu (padded regions will be zero)
+        return self._pad_tensor(mu)
 
     def _pad_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         pad_d, pad_h, pad_w = self.pad_amounts
@@ -111,173 +179,216 @@ class LatentZarrDataset(Dataset):
         return F.pad(tensor, (0, pad_w, 0, pad_h, 0, pad_d))
 
 
-def rectified_flow_loss(
-    model: UNet3DDiffusion,
-    x: torch.Tensor,
-    logit_mean: float = 0.0,
-    logit_std: float = 1.0,
+def create_padding_mask(
+    padded_shape: Tuple[int, int, int, int],
+    original_spatial: Tuple[int, int, int],
+    device: torch.device,
 ) -> torch.Tensor:
     """
-    Rectified flow loss with logit-normal timestep sampling.
+    Create a mask that is 1 in the valid (original) region and 0 in the padded region.
 
-    Logit-normal biases sampling toward middle timesteps (t ~ 0.5),
-    which are harder to predict and more informative for training.
-    This follows the approach used in Stable Diffusion 3.
+    Args:
+        padded_shape: (C, D, H, W) - the padded tensor shape
+        original_spatial: (D, H, W) - the original spatial dimensions before padding
+        device: torch device
 
-    x_t = (1 - t) * x + t * z0
-    v = z0 - x
-    loss = MSE(model(x_t, t), v)
+    Returns:
+        Mask tensor of shape (1, 1, D, H, W) broadcastable to (B, C, D, H, W)
+    """
+    _, d_pad, h_pad, w_pad = padded_shape
+    d_orig, h_orig, w_orig = original_spatial
+
+    mask = torch.zeros(1, 1, d_pad, h_pad, w_pad, device=device)
+    mask[:, :, :d_orig, :h_orig, :w_orig] = 1.0
+    return mask
+
+
+# -------------------------
+# EDM Loss
+# -------------------------
+
+
+def edm_loss(
+    model: EDMPrecond,
+    x: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    P_mean: float = -1.2,
+    P_std: float = 1.2,
+    sigma_data: float = 0.5,
+) -> torch.Tensor:
+    """
+    EDM training loss with log-normal sigma sampling.
+
+    From "Elucidating the Design Space of Diffusion-Based Generative Models":
+    - Sample sigma from log-normal: ln(σ) ~ N(P_mean, P_std²)
+    - Create noisy samples: x_noisy = x + σ * ε
+    - Loss weight: λ(σ) = (σ² + σ_data²) / (σ * σ_data)²
+    - Loss = λ(σ) * ||D_θ(x_noisy; σ) - x||²
+
+    If mask is provided, noise is only added to the valid region and
+    loss is only computed on the valid region.
     """
     batch_size = x.shape[0]
+    device = x.device
 
-    # Logit-normal sampling: sample from normal, then apply sigmoid
-    u = torch.randn(batch_size, device=x.device) * logit_std + logit_mean
-    t = torch.sigmoid(u)  # t in (0, 1), concentrated around 0.5
+    # Sample sigma from log-normal distribution
+    # ln(σ) ~ N(P_mean, P_std²) => σ = exp(P_mean + P_std * z), z ~ N(0,1)
+    ln_sigma = torch.randn(batch_size, device=device) * P_std + P_mean
+    sigma = ln_sigma.exp()  # (B,)
 
-    z0 = torch.randn_like(x)
-    t_bc = t[:, None, None, None, None]
-    x_t = (1 - t_bc) * x + t_bc * z0
-    v = z0 - x
-    v_pred = model(x_t, t)
-    return F.mse_loss(v_pred, v)
+    # Sample noise
+    noise = torch.randn_like(x)
+
+    # If mask is provided, zero out noise in padded regions
+    if mask is not None:
+        noise = noise * mask
+
+    # Create noisy samples: x_noisy = x + σ * ε
+    sigma_bc = sigma.view(-1, 1, 1, 1, 1)  # (B, 1, 1, 1, 1)
+    x_noisy = x + sigma_bc * noise
+
+    # Get denoised prediction
+    denoised = model(x_noisy, sigma)
+
+    # Loss weight: λ(σ) = (σ² + σ_data²) / (σ * σ_data)²
+    weight = (sigma**2 + sigma_data**2) / (sigma * sigma_data) ** 2
+    weight = weight.view(-1, 1, 1, 1, 1)  # (B, 1, 1, 1, 1)
+
+    # Compute loss only on valid (non-padded) regions
+    if mask is not None:
+        # Masked MSE loss: average over valid elements only
+        diff_sq = (denoised - x) ** 2
+        weighted_diff_sq = weight * diff_sq * mask
+        loss = weighted_diff_sq.sum() / mask.sum() / x.shape[1]  # normalize by channels
+    else:
+        diff_sq = (denoised - x) ** 2
+        loss = (weight * diff_sq).mean()
+
+    return loss
+
+
+# -------------------------
+# EDM Sampler (Heun's 2nd-order)
+# -------------------------
+
+
+def get_karras_sigmas(
+    num_steps: int,
+    sigma_min: float = 0.002,
+    sigma_max: float = 80.0,
+    rho: float = 7.0,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """
+    Generate Karras et al. noise schedule for EDM sampling.
+
+    σ_i = (σ_max^(1/ρ) + i/(n-1) * (σ_min^(1/ρ) - σ_max^(1/ρ)))^ρ
+
+    Returns sigma values from sigma_max to sigma_min (plus final 0).
+    """
+    ramp = torch.linspace(0, 1, num_steps, device=device)
+    min_inv_rho = sigma_min ** (1 / rho)
+    max_inv_rho = sigma_max ** (1 / rho)
+    sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+    # Append 0 at the end for the final step
+    sigmas = torch.cat([sigmas, torch.zeros(1, device=device)])
+    return sigmas
 
 
 @torch.no_grad()
-def sample_rectified_flow(
-    model: UNet3DDiffusion,
+def sample_edm_heun(
+    model: EDMPrecond,
     num_samples: int,
     latent_shape: Tuple[int, int, int, int],
     num_steps: int,
     device: torch.device,
+    sigma_min: float = 0.002,
+    sigma_max: float = 80.0,
+    rho: float = 7.0,
+    mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Basic Euler sampler for rectified flow.
-    Starts from x(t=1) ~ N(0, I) and integrates to t=0.
+    Heun's 2nd-order deterministic sampler for EDM.
+
+    Starts from x ~ N(0, σ_max²) and integrates to σ_min using the
+    probability flow ODE with Heun's method (predictor-corrector).
+
+    If mask is provided, noise is only in the valid region and
+    padded regions stay at zero throughout.
     """
     model.eval()
     channels, depth, height, width = latent_shape
-    x = torch.randn(
-        num_samples, channels, depth, height, width, device=device, dtype=torch.float32
-    )
-    t_vals = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
-    for i in range(num_steps):
-        t = t_vals[i]
-        t_next = t_vals[i + 1]
-        dt = t_next - t
-        t_batch = torch.full((num_samples,), t, device=device)
-        v = model(x, t_batch)
-        x = x + v * dt
+
+    # Get sigma schedule
+    sigmas = get_karras_sigmas(num_steps, sigma_min, sigma_max, rho, device)
+
+    # Initialize from N(0, σ_max²)
+    x = torch.randn(num_samples, channels, depth, height, width, device=device)
+    x = x * sigmas[0]  # Scale by σ_max
+
+    # Apply mask to initial noise if provided
+    if mask is not None:
+        x = x * mask
+
+    for i in range(len(sigmas) - 1):
+        sigma_cur = sigmas[i]
+        sigma_next = sigmas[i + 1]
+
+        # Get denoised estimate at current sigma
+        sigma_batch = sigma_cur.expand(num_samples)
+        denoised = model(x, sigma_batch)
+
+        # Derivative: d = (x - D(x, σ)) / σ
+        d_cur = (x - denoised) / sigma_cur
+
+        # Euler step (predictor)
+        x_next = x + (sigma_next - sigma_cur) * d_cur
+
+        # Heun correction (if not at final step)
+        if sigma_next > 0:
+            sigma_batch_next = sigma_next.expand(num_samples)
+            denoised_next = model(x_next, sigma_batch_next)
+            d_next = (x_next - denoised_next) / sigma_next
+            # Average the derivatives
+            x_next = x + (sigma_next - sigma_cur) * (d_cur + d_next) / 2
+
+        x = x_next
+
+        # Keep padded regions at zero after each step
+        if mask is not None:
+            x = x * mask
+
     model.train()
     return x
 
 
+# -------------------------
+# Config and Args
+# -------------------------
+
+
+def load_config(config_path: str) -> Dict[str, Any]:
+    """Load configuration from YAML file."""
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    return config
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train 3D diffusion model with rectified flow on latent Zarr."
+        description="Train 3D diffusion model with EDM on latent Zarr."
     )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config/train_diffusion_edm.yaml",
+        help="Path to YAML config file.",
+    )
+    cli_args = parser.parse_args()
 
-    # Data
-    parser.add_argument("--latents_zarr", type=str, required=True)
-    parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument(
-        "--no_logvar",
-        action="store_true",
-        help="Disable logvar sampling even if present in the Zarr store.",
-    )
-    parser.add_argument(
-        "--pad_to",
-        type=int,
-        default=32,
-        help="Pad each latent volume (D/H/W) up to at least this size.",
-    )
-
-    # Model
-    parser.add_argument("--base_channels", type=int, default=64)
-    parser.add_argument("--num_res_blocks", type=int, default=2)
-    parser.add_argument("--num_heads", type=int, default=4)
-    parser.add_argument(
-        "--channel_mults",
-        type=int,
-        nargs="+",
-        default=(1, 2, 4, 8),
-    )
-    parser.add_argument(
-        "--attn_levels",
-        type=int,
-        nargs="+",
-        default=(2, 3),
-    )
-    parser.add_argument("--dropout", type=float, default=0.0)
-
-    # Timestep sampling (logit-normal distribution)
-    parser.add_argument(
-        "--logit_mean",
-        type=float,
-        default=0.0,
-        help="Mean of logit-normal distribution for timestep sampling.",
-    )
-    parser.add_argument(
-        "--logit_std",
-        type=float,
-        default=1.0,
-        help="Std of logit-normal distribution for timestep sampling.",
-    )
-
-    # Training
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument(
-        "--warmup_samples",
-        type=int,
-        default=100_000,
-        help="Number of samples for linear LR warmup.",
-    )
-    parser.add_argument(
-        "--max_steps",
-        type=int,
-        default=150_000_000,
-        help="Total number of samples to process before stopping.",
-    )
-    parser.add_argument(
-        "--eval_every_steps",
-        type=int,
-        default=250_000,
-        help="Run validation every N samples processed.",
-    )
-    parser.add_argument(
-        "--num_eval_samples",
-        type=int,
-        default=32,
-        help="Number of samples to generate during evaluation.",
-    )
-    parser.add_argument(
-        "--num_eval_steps",
-        type=int,
-        default=64,
-        help="Number of inference steps for rectified flow sampling.",
-    )
-
-    # Output
-    parser.add_argument("--output_dir", type=str, default="outputs/diffusion_bigger")
-    parser.add_argument("--run_name", type=str, default=None, help="Wandb run name.")
-    parser.add_argument(
-        "--save_every",
-        type=int,
-        default=250_000,
-        help="Save checkpoint every N samples processed.",
-    )
-    parser.add_argument(
-        "--log_every",
-        type=int,
-        default=5_000,
-        help="Log training metrics every N samples processed.",
-    )
-    parser.add_argument("--progress", action="store_true")
-
-    return parser.parse_args()
+    # Load config from YAML (single source of truth)
+    config = load_config(cli_args.config)
+    return argparse.Namespace(**config)
 
 
 def _infer_latent_config(dataset: LatentZarrDataset) -> Tuple[int, int]:
@@ -287,6 +398,11 @@ def _infer_latent_config(dataset: LatentZarrDataset) -> Tuple[int, int]:
             f"UNet3DConfig requires cubic inputs; got D/H/W = {depth}/{height}/{width}."
         )
     return channels, depth
+
+
+# -------------------------
+# Main Training Loop
+# -------------------------
 
 
 def main() -> None:
@@ -309,6 +425,58 @@ def main() -> None:
         use_logvar=not args.no_logvar,
     )
     latent_channels, latent_spatial = _infer_latent_config(dataset)
+
+    # Compute or load latent statistics for normalization
+    stats_path = (
+        Path(args.stats_path)
+        if args.stats_path is not None
+        else output_dir / "latent_stats.json"
+    )
+
+    # Create padding mask for stats computation (exclude padded regions)
+    stats_mask = None
+    if dataset.pad_amounts != (0, 0, 0):
+        stats_mask = create_padding_mask(
+            padded_shape=dataset.latent_shape,
+            original_spatial=dataset.original_spatial,
+            device=torch.device(
+                "cpu"
+            ),  # Will be moved to device in compute_latent_stats_ddp
+        )
+
+    if stats_path.exists() and not args.recompute_stats:
+        if accelerator.is_main_process:
+            logger.info("Loading latent stats from %s", stats_path)
+    else:
+        if accelerator.is_main_process:
+            logger.info("Computing latent mean/std (distributed streaming)")
+        # Compute stats accounting for VAE sampling variance
+        stats = compute_latent_stats_ddp(
+            args.latents_zarr,
+            args.stats_batch_size,
+            args.num_workers,
+            accelerator,
+            num_channels=latent_channels,
+            pad_to=pad_to,
+            mask=stats_mask,
+        )
+        if accelerator.is_main_process:
+            save_stats(stats_path, stats)
+            logger.info("Saved latent stats to %s", stats_path)
+
+    accelerator.wait_for_everyone()
+    stats = load_stats(stats_path)
+
+    # Reshape mean/std for broadcasting: (1, C, 1, 1, 1)
+    latent_mean = stats["mean"].float().view(1, latent_channels, 1, 1, 1)
+    latent_std = stats["std"].float().view(1, latent_channels, 1, 1, 1)
+
+    if accelerator.is_main_process:
+        logger.info(
+            "Latent stats - mean: %s, std: %s",
+            stats["mean"].tolist(),
+            stats["std"].tolist(),
+        )
 
     dataset_size = len(dataset)
     holdout_size = max(1, math.ceil(dataset_size * 0.01))
@@ -341,7 +509,10 @@ def main() -> None:
         dropout=args.dropout,
         input_spatial=latent_spatial,
     )
-    model = UNet3DDiffusion(model_cfg)
+    raw_model = UNet3DDiffusion(model_cfg)
+
+    # Wrap with EDM preconditioning
+    model = EDMPrecond(raw_model, sigma_data=args.sigma_data)
 
     # Create EMA model for improved sample quality
     ema_model = EMAModel(model.parameters(), decay=0.9999)
@@ -378,14 +549,36 @@ def main() -> None:
     # Move EMA to accelerator device after model is prepared
     ema_model.to(accelerator.device)
 
+    # Move latent stats to device for normalization
+    latent_mean = latent_mean.to(accelerator.device)
+    latent_std = latent_std.to(accelerator.device)
+
+    # Create padding mask if there is padding (to keep padded regions at zero during training)
+    padding_mask = None
+    if dataset.pad_amounts != (0, 0, 0):
+        padding_mask = create_padding_mask(
+            padded_shape=dataset.latent_shape,
+            original_spatial=dataset.original_spatial,
+            device=accelerator.device,
+        )
+        if accelerator.is_main_process:
+            logger.info(
+                "Padding mask created: original %s -> padded %s",
+                dataset.original_spatial,
+                dataset.padded_spatial,
+            )
+
     if accelerator.is_main_process:
         total_params = sum(p.numel() for p in model.parameters())
-        logger.info("Model parameters: %d", total_params)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(
+            "Model parameters: %d (trainable: %d)", total_params, trainable_params
+        )
 
     wandb_run = None
     if accelerator.is_main_process:
         init_kwargs = {
-            "project": "maggrav-rectified-flow",
+            "project": "maggrav-edm",
             "config": {
                 **vars(args),
                 "latent_channels": latent_channels,
@@ -428,8 +621,15 @@ def main() -> None:
         model.train()
         with accelerator.accumulate(model):
             batch = batch.to(accelerator.device, non_blocking=True)
-            loss = rectified_flow_loss(
-                model, batch, logit_mean=args.logit_mean, logit_std=args.logit_std
+            # Normalize latents to zero mean, unit variance
+            batch = (batch - latent_mean) / latent_std
+            loss = edm_loss(
+                model,
+                batch,
+                mask=padding_mask,
+                P_mean=args.P_mean,
+                P_std=args.P_std,
+                sigma_data=args.sigma_data,
             )
 
             accelerator.backward(loss)
@@ -482,16 +682,24 @@ def main() -> None:
             if accelerator.is_main_process:
                 unwrapped_model = accelerator.unwrap_model(model)
                 # Use EMA weights for evaluation sampling
-                ema_model.copy_to(unwrapped_model.parameters())
-                samples = sample_rectified_flow(
+                ema_model.store(unwrapped_model.parameters())  # Backup original weights
+                ema_model.copy_to(unwrapped_model.parameters())  # Load EMA weights
+                samples = sample_edm_heun(
                     unwrapped_model,
                     num_samples=args.num_eval_samples,
                     latent_shape=dataset.latent_shape,
                     num_steps=args.num_eval_steps,
                     device=accelerator.device,
+                    sigma_min=args.sigma_min,
+                    sigma_max=args.sigma_max,
+                    rho=args.rho,
+                    mask=padding_mask,
                 )
-                # Restore original weights after sampling
-                ema_model.restore(unwrapped_model.parameters())
+                ema_model.restore(
+                    unwrapped_model.parameters()
+                )  # Restore original weights
+                # Denormalize samples back to original latent space
+                samples = samples * latent_std + latent_mean
                 orig_d, orig_h, orig_w = dataset.original_spatial
                 if (
                     samples.shape[2] != orig_d
@@ -550,9 +758,14 @@ def main() -> None:
                     "config": model_cfg,
                     "args": vars(args),
                     "latents_zarr": args.latents_zarr,
+                    "original_spatial": dataset.original_spatial,
+                    "latent_shape": dataset.latent_shape,
+                    "sigma_data": args.sigma_data,
+                    "latent_mean": latent_mean.cpu(),
+                    "latent_std": latent_std.cpu(),
                 }
                 checkpoint_path = (
-                    output_dir / f"diffusion_checkpoint_step_{global_samples}.pt"
+                    output_dir / f"edm_checkpoint_step_{global_samples}.pt"
                 )
                 torch.save(checkpoint, checkpoint_path)
                 logger.info("Saved checkpoint: %s", checkpoint_path)
@@ -574,10 +787,13 @@ def main() -> None:
                 "config": model_cfg,
                 "args": vars(args),
                 "latents_zarr": args.latents_zarr,
+                "original_spatial": dataset.original_spatial,
+                "latent_shape": dataset.latent_shape,
+                "sigma_data": args.sigma_data,
+                "latent_mean": latent_mean.cpu(),
+                "latent_std": latent_std.cpu(),
             }
-            checkpoint_path = (
-                output_dir / f"diffusion_checkpoint_step_{global_samples}.pt"
-            )
+            checkpoint_path = output_dir / f"edm_checkpoint_step_{global_samples}.pt"
             torch.save(checkpoint, checkpoint_path)
             logger.info("Saved checkpoint: %s", checkpoint_path)
 

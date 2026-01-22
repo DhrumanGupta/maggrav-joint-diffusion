@@ -15,4 +15,4 @@ source .venv/bin/activate
 
 # nohup python src/concat_zarrs.py /scratch/dhruman_gupta/noddyverse_preprocessed/output/ /scratch/dhruman_gupta/noddyverse_preprocessed/output-final --batch-size 128 --workers 32 --blosc-threads 4 --compressor zstd --clevel 3 > concat_zarrs.log 2>&1 &
 
-nohup accelerate launch src/train_vae.py --zarr_path /scratch/dhruman_gupta/noddyverse_preprocessed/output-final > logs/train_vae.log 2>&1 &
+nohup accelerate launch src/train_vae.py --config config/train_vae.yaml > logs/train_vae.log 2>&1 &

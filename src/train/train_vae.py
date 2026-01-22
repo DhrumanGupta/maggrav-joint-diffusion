@@ -2,8 +2,8 @@
 Train a 3D VAE on density + susceptibility volumes.
 
 Usage:
-    python src/train_vae.py --zarr_path /path/to/zarr --max_steps 100000
-    accelerate launch src/train_vae.py --zarr_path /path/to/zarr --max_steps 100000
+    python src/train_vae.py --config config/train_vae.yaml
+    accelerate launch src/train_vae.py --config config/train_vae.yaml
 """
 
 import argparse
@@ -12,19 +12,20 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict
 
 import torch
 import torch.nn.functional as F
+import yaml
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from torch.utils.data import DataLoader, Dataset, Subset
-from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 import wandb
-from vae import VAE3D, VAE3DConfig
-from zarr_dataset import NoddyverseZarrDataset
+from data.stats_utils import compute_streaming_stats_ddp, load_stats, save_stats
+from models.vae import VAE3D, VAE3DConfig
+from data.zarr_dataset import NoddyverseZarrDataset
 
 logging.basicConfig(
     format="%(asctime)s %(message)s",
@@ -51,107 +52,6 @@ class JointDensitySuscDataset(Dataset):
         density = sample["density"]
         susceptibility = sample["susceptibility"]
         return torch.stack([density, susceptibility], dim=0)
-
-
-def _stats_from_tensor(
-    x: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Compute per-channel sum and sumsq for a batch tensor.
-    Returns (sum, sumsq, count).
-    """
-    x = x.float()
-    b, c, d, h, w = x.shape
-    x = x.reshape(b, c, -1)
-    count = torch.tensor(b * x.shape[2], dtype=torch.float32, device=x.device)
-    sum_ = x.sum(dim=(0, 2))
-    sumsq = (x * x).sum(dim=(0, 2))
-    return sum_, sumsq, count
-
-
-def compute_streaming_stats_ddp(
-    dataset: Dataset,
-    batch_size: int,
-    num_workers: int,
-    accelerator: Accelerator,
-) -> Dict[str, torch.Tensor]:
-    if accelerator.num_processes > 1:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=accelerator.num_processes,
-            rank=accelerator.process_index,
-            shuffle=False,
-            drop_last=False,
-        )
-    else:
-        sampler = None
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False if sampler is None else False,
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=2,
-        persistent_workers=True,
-    )
-    if sampler is not None:
-        sampler.set_epoch(0)
-
-    device = accelerator.device
-    count = torch.zeros(1, dtype=torch.float32, device=device)
-    sum_ = torch.zeros(2, dtype=torch.float32, device=device)
-    sumsq = torch.zeros(2, dtype=torch.float32, device=device)
-
-    progress = tqdm(
-        loader,
-        desc="Computing mean/std",
-        disable=not accelerator.is_local_main_process,
-    )
-
-    for batch in progress:
-        batch = batch.to(device, non_blocking=True)
-        batch_sum, batch_sumsq, batch_count = _stats_from_tensor(batch)
-        sum_ += batch_sum
-        sumsq += batch_sumsq
-        count += batch_count
-
-    # All-reduce across processes for exact global sums
-    sum_ = accelerator.reduce(sum_, reduction="sum")
-    sumsq = accelerator.reduce(sumsq, reduction="sum")
-    count = accelerator.reduce(count, reduction="sum")
-
-    mean = sum_ / count
-    var = sumsq / count - mean.pow(2)
-    std = torch.sqrt(var.clamp_min(0))
-
-    return {
-        "count": count.cpu(),
-        "mean": mean.cpu(),
-        "std": std.cpu(),
-    }
-
-
-def load_stats(stats_path: Path) -> Dict[str, torch.Tensor]:
-    with stats_path.open("r") as f:
-        payload = json.load(f)
-    return {
-        "count": torch.tensor(payload["count"], dtype=torch.float64),
-        "mean": torch.tensor(payload["mean"], dtype=torch.float64),
-        "std": torch.tensor(payload["std"], dtype=torch.float64),
-    }
-
-
-def save_stats(stats_path: Path, stats: Dict[str, torch.Tensor]) -> None:
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "count": stats["count"].tolist(),
-        "mean": stats["mean"].tolist(),
-        "std": stats["std"].tolist(),
-    }
-    with stats_path.open("w") as f:
-        json.dump(payload, f, indent=2)
 
 
 @torch.no_grad()
@@ -204,66 +104,27 @@ def evaluate(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train 3D VAE with Accelerate")
-
-    # Data
-    parser.add_argument("--zarr_path", type=str, required=True)
-    parser.add_argument("--stats_path", type=str, default=None)
-    parser.add_argument("--recompute_stats", action="store_true")
-    parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--stats_batch_size", type=int, default=8)
-
-    # Model
-    parser.add_argument("--downsample_factor", type=int, default=8)
-    parser.add_argument("--base_channels", type=int, default=24)
-    parser.add_argument("--latent_channels", type=int, default=48)
-    parser.add_argument("--blocks_per_stage", type=int, default=2)
-
-    # Training
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--kl_weight", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument(
-        "--max_steps",
-        type=int,
-        default=10_000_000,
-        help="Total number of samples to process before stopping.",
+        "--config",
+        type=str,
+        default="config/train_vae.yaml",
+        help="Path to YAML config file.",
     )
-    parser.add_argument(
-        "--eval_every_steps",
-        type=int,
-        default=125_000,
-        help="Run validation every N samples processed.",
-    )
+    cli_args = parser.parse_args()
 
-    # Output
-    parser.add_argument("--output_dir", type=str, default="outputs_vae")
-    parser.add_argument(
-        "--save_every",
-        type=int,
-        default=125_000,
-        help="Save checkpoint every N samples processed.",
-    )
-    parser.add_argument(
-        "--log_every",
-        type=int,
-        default=800,
-        help="Log training metrics every N samples processed.",
-    )
-    parser.add_argument("--progress", action="store_true")
-    parser.add_argument(
-        "--profile",
-        action="store_true",
-        help="Log per-epoch data vs compute timing on main process.",
-    )
-
-    return parser.parse_args()
+    with open(cli_args.config, "r") as f:
+        config = yaml.safe_load(f)
+    if not isinstance(config, dict):
+        raise ValueError(f"Config must be a mapping/dict: {cli_args.config}")
+    return argparse.Namespace(**config)
 
 
 def main() -> None:
     args = parse_args()
+    if not hasattr(args, "kl_warmup_steps"):
+        args.kl_warmup_steps = 0
+    if not hasattr(args, "warmup_steps"):
+        args.warmup_steps = 0
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision="bf16",
@@ -287,7 +148,11 @@ def main() -> None:
         logger.info("Computing global mean/std (distributed streaming)")
         stats_dataset = JointDensitySuscDataset(args.zarr_path)
         stats = compute_streaming_stats_ddp(
-            stats_dataset, args.stats_batch_size, args.num_workers, accelerator
+            stats_dataset,
+            args.stats_batch_size,
+            args.num_workers,
+            accelerator,
+            num_channels=2,  # density + susceptibility
         )
         if accelerator.is_main_process:
             save_stats(stats_path, stats)
@@ -431,6 +296,22 @@ def main() -> None:
             compute_start = time.perf_counter()
 
         model.train()
+        lr_warmup_steps = int(getattr(args, "warmup_steps", 0) or 0)
+        if lr_warmup_steps > 0:
+            lr_scale = min(1.0, float(global_samples) / float(lr_warmup_steps))
+            current_lr = float(args.lr) * lr_scale
+        else:
+            current_lr = float(args.lr)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr
+
+        kl_warmup_steps = int(getattr(args, "kl_warmup_steps", 0) or 0)
+        if kl_warmup_steps > 0:
+            kl_weight = float(args.kl_weight) * min(
+                1.0, float(global_samples) / float(kl_warmup_steps)
+            )
+        else:
+            kl_weight = float(args.kl_weight)
         with accelerator.accumulate(model):
             batch = batch.to(accelerator.device, non_blocking=True)
             batch = (batch - mean) / std
@@ -439,7 +320,7 @@ def main() -> None:
                 recon, mu, logvar = model(batch)
                 recon_loss = F.mse_loss(recon, batch)
                 kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                loss = recon_loss + args.kl_weight * kl_loss
+                loss = recon_loss + kl_weight * kl_loss
 
             accelerator.backward(loss)
             if accelerator.sync_gradients and args.grad_clip > 0:
@@ -517,6 +398,10 @@ def main() -> None:
                         "train/recon_loss": log_recon_sum / log_samples,
                         "train/kl_loss": log_kl_sum / log_samples,
                         "train/total_loss": log_total_sum / log_samples,
+                        "train/kl_weight": kl_weight,
+                        "train/lr": current_lr,
+                        "train/kl_warmup_steps": int(args.kl_warmup_steps),
+                        "train/warmup_steps": int(args.warmup_steps),
                     },
                     step=global_samples,
                 )
@@ -529,9 +414,7 @@ def main() -> None:
             window_compute_time += time.perf_counter() - compute_start
 
         if global_samples >= next_eval:
-            val_metrics = evaluate(
-                model, val_loader, mean, std, args.kl_weight, accelerator
-            )
+            val_metrics = evaluate(model, val_loader, mean, std, kl_weight, accelerator)
             if accelerator.is_main_process:
                 if val_metrics["total_loss"] < best_val_loss:
                     best_val_loss = val_metrics["total_loss"]
@@ -563,6 +446,10 @@ def main() -> None:
                     "val/recon_loss": val_metrics["recon_loss"],
                     "val/kl_loss": val_metrics["kl_loss"],
                     "val/total_loss": val_metrics["total_loss"],
+                    "val/kl_weight": kl_weight,
+                    "val/lr": current_lr,
+                    "val/kl_warmup_steps": int(args.kl_warmup_steps),
+                    "val/warmup_steps": int(args.warmup_steps),
                 }
                 if eval_samples > 0:
                     payload.update(

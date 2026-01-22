@@ -1,0 +1,49 @@
+# EDM diffusion model training configuration
+
+# Data
+latents_zarr: /scratch/dhruman_gupta/noddyverse_preprocessed/encoded_latents.zarr
+num_workers: 8
+no_logvar: false
+pad_to: 32
+
+# Stats (latent normalization)
+stats_path: null  # auto-generates in output_dir if null
+recompute_stats: false
+stats_batch_size: 32
+
+# Model
+base_channels: 64
+num_res_blocks: 2
+num_heads: 4
+channel_mults: [1, 2, 4, 8]
+attn_levels: [2, 3]
+dropout: 0.0
+
+# EDM-specific parameters (replacing logit_mean, logit_std from rectified flow)
+sigma_data: 1.0      # Std of training data (1.0 since latents are normalized to unit variance)
+sigma_min: 0.002     # Minimum noise level for sampling
+sigma_max: 80.0      # Maximum noise level for sampling
+rho: 7.0             # Karras schedule curvature
+P_mean: -1.2         # Log-normal mean for training sigma sampling
+P_std: 1.2           # Log-normal std for training sigma sampling
+
+# Training
+batch_size: 32
+lr: 1.0e-4
+grad_clip: 1.0
+seed: 42
+gradient_accumulation_steps: 1
+warmup_samples: 1000000
+max_steps: 150000000
+
+# Evaluation
+eval_every_steps: 250000
+num_eval_samples: 32
+num_eval_steps: 64
+
+# Output
+output_dir: outputs/edm_150m
+run_name: edm_150m
+save_every: 250000
+log_every: 5000
+progress: false
