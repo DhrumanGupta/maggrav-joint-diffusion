@@ -65,6 +65,7 @@ shellingham==1.5.4
 six==1.17.0
 smmap==5.0.2
 sympy==1.14.0
+--extra-index-url https://download.pytorch.org/whl/cu130
 torch==2.10.0+cu130
 torchvision==0.25.0+cu130
 tqdm==4.67.1
