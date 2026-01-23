@@ -171,17 +171,22 @@ def main() -> None:
         args.kl_warmup_steps = 0
     if not hasattr(args, "warmup_steps"):
         args.warmup_steps = 0
+
+    # Initialize CUDA context BEFORE creating Accelerator to avoid NCCL errors
+    # This must happen before any distributed initialization
+    if torch.cuda.is_available():
+        # Get local rank from environment (set by accelerate/torchrun)
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        torch.cuda.init()
+        torch.cuda.synchronize()
+        # Force CUDA context creation
+        _ = torch.empty(1, device=f"cuda:{local_rank}")
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision="bf16",
     )
-
-    # Initialize CUDA context early, before any NCCL operations
-    if torch.cuda.is_available():
-        torch.cuda.set_device(accelerator.local_process_index)
-        torch.cuda.init()
-        torch.cuda.synchronize()
-        _ = torch.empty(1, device="cuda")
 
     set_seed(args.seed)
 
