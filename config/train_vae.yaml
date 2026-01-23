@@ -2,7 +2,7 @@
 
 # Data
 # zarr_path: /scratch/dhruman_gupta/noddyverse_preprocessed/output-final
-zarr_path: /workspace/output-final
+zarr_path: /workspace/noddyverse_preprocessed/output-final
 stats_path: ./vae_stats.json
 recompute_stats: false
 num_workers: 8
