@@ -16,22 +16,21 @@ latent_channels: 32
 blocks_per_stage: 2
 
 # Training
-batch_size: 2
+batch_size: 16
 lr: 1.0e-4
-kl_weight: 1.0e-4
+kl_weight: 1.0e-3
 
 # KL warmup (in samples processed): KL weight ramps 0 -> kl_weight over this many samples.
-kl_warmup_steps: 375000
+kl_warmup_steps: 500000
 
 # LR warmup (in samples processed): LR ramps 0 -> lr over this many samples.
-warmup_steps: 45000
+warmup_steps: 60000
 grad_clip: 1.0
 seed: 42
 gradient_accumulation_steps: 1
 
 # Total number of samples to process before stopping.
-max_steps: 1500000
-# max_steps: 10000000
+max_steps: 2000000
 
 # Run validation every N samples processed.
 eval_every_steps: 250000
@@ -43,7 +42,7 @@ output_dir: outputs_vae
 save_every: 250000
 
 # Log training metrics every N samples processed.
-log_every: 800
+log_every: 400
 
 # Progress bar on local main process.
 progress: false
