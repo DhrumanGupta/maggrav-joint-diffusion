@@ -27,12 +27,65 @@ from ..data.stats_utils import compute_streaming_stats_ddp, load_stats, save_sta
 from ..models.vae import VAE3D, VAE3DConfig
 from ..utils.datasets import JointDensitySuscDataset
 
+# Padding constants: original data is 200³, pad to 256³ for nice latent dimensions
+ORIGINAL_SIZE = 200
+PADDED_SIZE = 256
+PAD_AMOUNT = (PADDED_SIZE - ORIGINAL_SIZE) // 2  # 28 on each side
+DOWNSAMPLE_FACTOR = 8  # Must match config
+# Latent padding: use ceil to ensure we only include fully-valid latent positions
+LATENT_PAD = (PAD_AMOUNT + DOWNSAMPLE_FACTOR - 1) // DOWNSAMPLE_FACTOR  # 4
+LATENT_VALID_SIZE = (PADDED_SIZE // DOWNSAMPLE_FACTOR) - 2 * LATENT_PAD  # 24
+
 logging.basicConfig(
     format="%(asctime)s %(message)s",
     datefmt="%H:%M:%S",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+def pad_to_256(x: torch.Tensor) -> torch.Tensor:
+    """Pad input from (B, C, 200, 200, 200) to (B, C, 256, 256, 256) with zeros."""
+    # F.pad expects (left, right, top, bottom, front, back) for 3D
+    return F.pad(
+        x, (PAD_AMOUNT, PAD_AMOUNT, PAD_AMOUNT, PAD_AMOUNT, PAD_AMOUNT, PAD_AMOUNT)
+    )
+
+
+def extract_valid_region(x: torch.Tensor) -> torch.Tensor:
+    """Extract the original 200³ region from a 256³ tensor."""
+    return x[
+        :,
+        :,
+        PAD_AMOUNT : PAD_AMOUNT + ORIGINAL_SIZE,
+        PAD_AMOUNT : PAD_AMOUNT + ORIGINAL_SIZE,
+        PAD_AMOUNT : PAD_AMOUNT + ORIGINAL_SIZE,
+    ]
+
+
+def masked_mse_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Compute MSE loss only on the valid 200³ region."""
+    recon_valid = extract_valid_region(recon)
+    target_valid = extract_valid_region(target)
+    return F.mse_loss(recon_valid, target_valid)
+
+
+def extract_valid_latent_region(x: torch.Tensor) -> torch.Tensor:
+    """Extract the latent region corresponding to valid input data.
+
+    With 8x downsampling and 28-pixel padding, the valid latent region
+    is [4:-4] in each spatial dimension (24³ out of 32³).
+    """
+    return x[
+        :, :, LATENT_PAD:-LATENT_PAD, LATENT_PAD:-LATENT_PAD, LATENT_PAD:-LATENT_PAD
+    ]
+
+
+def masked_kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    """Compute KL loss only on the valid latent region."""
+    mu_valid = extract_valid_latent_region(mu)
+    logvar_valid = extract_valid_latent_region(logvar)
+    return -0.5 * torch.mean(1 + logvar_valid - mu_valid.pow(2) - logvar_valid.exp())
 
 
 @torch.no_grad()
@@ -54,12 +107,15 @@ def evaluate(
 
     for batch in dataloader:
         batch = batch.to(device, non_blocking=True)
+        # Normalize then pad to 256³
         batch = (batch - mean) / std
+        batch_padded = pad_to_256(batch)
 
         with accelerator.autocast():
-            recon, mu, logvar = model(batch)
-            recon_loss = F.mse_loss(recon, batch)
-            kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            recon, mu, logvar = model(batch_padded)
+            # Compute losses only on valid regions
+            recon_loss = masked_mse_loss(recon, batch_padded)
+            kl_loss = masked_kl_loss(mu, logvar)
             loss = recon_loss + kl_weight * kl_loss
 
         batch_size = batch.size(0)
@@ -91,12 +147,21 @@ def parse_args() -> argparse.Namespace:
         default="config/train_vae.yaml",
         help="Path to YAML config file.",
     )
+    # CLI overrides for sweep/grid search
+    parser.add_argument(
+        "--kl_weight", type=float, default=None, help="Override kl_weight from config"
+    )
     cli_args = parser.parse_args()
 
     with open(cli_args.config, "r") as f:
         config = yaml.safe_load(f)
     if not isinstance(config, dict):
         raise ValueError(f"Config must be a mapping/dict: {cli_args.config}")
+
+    # Apply CLI overrides
+    if cli_args.kl_weight is not None:
+        config["kl_weight"] = cli_args.kl_weight
+
     return argparse.Namespace(**config)
 
 
@@ -295,12 +360,15 @@ def main() -> None:
             kl_weight = float(args.kl_weight)
         with accelerator.accumulate(model):
             batch = batch.to(accelerator.device, non_blocking=True)
+            # Normalize then pad to 256³
             batch = (batch - mean) / std
+            batch_padded = pad_to_256(batch)
 
             with accelerator.autocast():
-                recon, mu, logvar = model(batch)
-                recon_loss = F.mse_loss(recon, batch)
-                kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                recon, mu, logvar = model(batch_padded)
+                # Compute losses only on valid regions
+                recon_loss = masked_mse_loss(recon, batch_padded)
+                kl_loss = masked_kl_loss(mu, logvar)
                 loss = recon_loss + kl_weight * kl_loss
 
             accelerator.backward(loss)
@@ -381,8 +449,6 @@ def main() -> None:
                         "train/total_loss": log_total_sum / log_samples,
                         "train/kl_weight": kl_weight,
                         "train/lr": current_lr,
-                        "train/kl_warmup_steps": int(args.kl_warmup_steps),
-                        "train/warmup_steps": int(args.warmup_steps),
                     },
                     step=global_samples,
                 )
@@ -427,10 +493,6 @@ def main() -> None:
                     "val/recon_loss": val_metrics["recon_loss"],
                     "val/kl_loss": val_metrics["kl_loss"],
                     "val/total_loss": val_metrics["total_loss"],
-                    "val/kl_weight": kl_weight,
-                    "val/lr": current_lr,
-                    "val/kl_warmup_steps": int(args.kl_warmup_steps),
-                    "val/warmup_steps": int(args.warmup_steps),
                 }
                 if eval_samples > 0:
                     payload.update(

@@ -1,0 +1,25 @@
+# W&B Sweep config for VAE kl_weight grid search
+# Usage:
+#   wandb sweep config/sweep_vae.yaml
+#   wandb agent <sweep_id>
+
+project: maggrav-vae
+program: src/train/train_vae.py
+method: grid
+
+# Disable torch.compile to avoid inductor cache issues between runs
+env:
+  TORCHDYNAMO_DISABLE: "1"
+
+parameters:
+  kl_weight:
+    values: [0.00001, 0.0001, 0.001, 0.01]
+
+command:
+  - accelerate
+  - launch
+  - -m
+  - src.train.train_vae
+  - --config
+  - config/train_vae.yaml
+  - ${args}

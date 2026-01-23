@@ -282,7 +282,7 @@ def main() -> None:
         collate_fn=_collate_with_indices,
     )
     if args.num_workers > 0:
-        loader_kwargs.update(prefetch_factor=2, persistent_workers=True)
+        loader_kwargs.update(prefetch_factor=8, persistent_workers=True)
 
     dataloader = DataLoader(**loader_kwargs)
 

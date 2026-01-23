@@ -156,7 +156,7 @@ def compute_streaming_stats_ddp(
         pin_memory=True,
     )
     if num_workers > 0:
-        loader_kwargs.update(prefetch_factor=2, persistent_workers=True)
+        loader_kwargs.update(prefetch_factor=8, persistent_workers=True)
 
     loader = DataLoader(dataset, **loader_kwargs)
     if sampler is not None:
@@ -309,7 +309,7 @@ def compute_latent_stats_ddp(
         pin_memory=True,
     )
     if num_workers > 0:
-        loader_kwargs.update(prefetch_factor=2, persistent_workers=True)
+        loader_kwargs.update(prefetch_factor=8, persistent_workers=True)
 
     loader = DataLoader(dataset, **loader_kwargs)
     if sampler is not None:
