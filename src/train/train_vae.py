@@ -204,6 +204,14 @@ def main() -> None:
             save_stats(stats_path, stats)
             logger.info(f"Saved stats to {stats_path}")
 
+    if torch.cuda.is_available():
+        # map rank -> correct device
+        torch.cuda.set_device(accelerator.local_process_index)
+        # force CUDA runtime/context init on this device before NCCL touches it
+        torch.cuda.init()
+        torch.cuda.synchronize()
+        _ = torch.empty(1, device="cuda")
+
     accelerator.wait_for_everyone()
     stats = load_stats(stats_path)
 
