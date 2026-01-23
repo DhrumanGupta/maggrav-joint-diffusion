@@ -175,6 +175,14 @@ def main() -> None:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision="bf16",
     )
+
+    # Initialize CUDA context early, before any NCCL operations
+    if torch.cuda.is_available():
+        torch.cuda.set_device(accelerator.local_process_index)
+        torch.cuda.init()
+        torch.cuda.synchronize()
+        _ = torch.empty(1, device="cuda")
+
     set_seed(args.seed)
 
     output_dir = Path(args.output_dir)
@@ -203,14 +211,6 @@ def main() -> None:
         if accelerator.is_main_process:
             save_stats(stats_path, stats)
             logger.info(f"Saved stats to {stats_path}")
-
-    if torch.cuda.is_available():
-        # map rank -> correct device
-        torch.cuda.set_device(accelerator.local_process_index)
-        # force CUDA runtime/context init on this device before NCCL touches it
-        torch.cuda.init()
-        torch.cuda.synchronize()
-        _ = torch.empty(1, device="cuda")
 
     accelerator.wait_for_everyone()
     stats = load_stats(stats_path)
