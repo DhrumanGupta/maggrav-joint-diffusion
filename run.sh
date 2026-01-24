@@ -13,6 +13,8 @@ source .venv/bin/activate
 #     --temp-root "/scratch/dhruman_gupta/noddyverse_data" \
 #     > preprocessing.log 2>&1 &
 
-# nohup python src/concat_zarrs.py /scratch/dhruman_gupta/noddyverse_preprocessed/output/ /scratch/dhruman_gupta/noddyverse_preprocessed/output-final --batch-size 128 --workers 32 --blosc-threads 4 --compressor zstd --clevel 3 > concat_zarrs.log 2>&1 &
+# nohup python -m src.data.concat_zarrs /scratch/dhruman_gupta/noddyverse_preprocessed/output/ ./output-final --batch-size 128 --workers 32 > concat_zarrs.log 2>&1 &
 
 nohup accelerate launch src/train_vae.py --config config/train_vae.yaml > logs/train_vae.log 2>&1 &
+
+# python -m src.data.concat_zarrs /scratch/dhruman_gupta/noddyverse_preprocessed/output/ ./output-final --batch-size 64 --workers 32

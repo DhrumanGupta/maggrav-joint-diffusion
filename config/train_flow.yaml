@@ -38,8 +38,8 @@ num_eval_samples: 32
 num_eval_steps: 64
 
 # Output
-output_dir: outputs/diffusion_150m
-run_name: diffusion_150m
+output_dir: outputs/flow_150m
+run_name: flow_150m
 save_every: 250000
 log_every: 5000
 progress: false

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -99,19 +100,33 @@ def _validate_store(
     return sample_count, expected
 
 
-def _copy_array(
-    src: zarr.Array, dst: zarr.Array, dst_offset: int, batch_size: int
+def _copy_array_range(
+    src: zarr.Array,
+    dst: zarr.Array,
+    dst_offset: int,
+    start: int,
+    end: int,
+    batch_size: int,
 ) -> None:
     total = int(src.shape[0])
     if total == 0:
+        return
+    if start < 0 or end > total or start >= end:
         return
     step = batch_size if batch_size > 0 else 0
     if step <= 0:
         chunk0 = src.chunks[0] if src.chunks else 1
         step = int(chunk0) if isinstance(chunk0, int) and chunk0 > 0 else 1
-    for start in range(0, total, step):
-        end = min(total, start + step)
-        dst[dst_offset + start : dst_offset + end] = src[start:end]
+    for pos in range(start, end, step):
+        stop = min(end, pos + step)
+        dst[dst_offset + pos : dst_offset + stop] = src[pos:stop]
+
+
+def _copy_array(
+    src: zarr.Array, dst: zarr.Array, dst_offset: int, batch_size: int
+) -> None:
+    total = int(src.shape[0])
+    _copy_array_range(src, dst, dst_offset, 0, total, batch_size)
 
 
 def _parse_metadata(raw: Optional[str], path: str, expected_count: int) -> List[str]:
@@ -137,14 +152,16 @@ def _configure_blosc_threads(num_threads: int) -> None:
         blosc.set_nthreads(num_threads)
 
 
-def _copy_store_worker(args: Tuple[str, str, int, int, int]) -> None:
-    input_path, output_path, offset, batch_size, blosc_threads = args
+def _copy_store_worker(args: Tuple[str, str, int, int, int, int, int]) -> None:
+    input_path, output_path, offset, start, end, batch_size, blosc_threads = args
     _configure_blosc_threads(blosc_threads)
     store = zarr.open_group(input_path, mode="r")
     out = zarr.open_group(output_path, mode="r+")
-    _copy_array(store["rock_types"], out["rock_types"], offset, batch_size)
-    _copy_array(store["mag"], out["mag"], offset, batch_size)
-    _copy_array(store["grv"], out["grv"], offset, batch_size)
+    _copy_array_range(
+        store["rock_types"], out["rock_types"], offset, start, end, batch_size
+    )
+    _copy_array_range(store["mag"], out["mag"], offset, start, end, batch_size)
+    _copy_array_range(store["grv"], out["grv"], offset, start, end, batch_size)
 
 
 def main() -> None:
@@ -172,13 +189,13 @@ def main() -> None:
     parser.add_argument(
         "--compressor",
         choices=("lz4", "zstd"),
-        default="lz4",
+        default="zstd",
         help="Blosc compressor to use for the concatenated Zarr.",
     )
     parser.add_argument(
         "--clevel",
         type=int,
-        default=1,
+        default=8,
         help="Compression level for Blosc (lz4 ignores levels > 1).",
     )
     parser.add_argument(
@@ -233,13 +250,9 @@ def main() -> None:
     rock_shape, rock_dtype = expected["rock_types"]
     mag_shape, mag_dtype = expected["mag"]
     grv_shape, grv_dtype = expected["grv"]
-    chunk_3d = tuple(args.chunk_3d) if args.chunk_3d is not None else (1, *rock_shape)
-    chunk_2d = tuple(args.chunk_2d) if args.chunk_2d is not None else (1, *mag_shape)
-    if args.workers > 1 and (chunk_3d[0] != 1 or chunk_2d[0] != 1):
-        raise SystemExit(
-            "Parallel copy requires sample-axis chunk size of 1 to avoid "
-            "chunk write conflicts. Use --workers 1 or set chunk sizes to 1."
-        )
+    chunk_3d = tuple(args.chunk_3d) if args.chunk_3d is not None else (64, *rock_shape)
+    chunk_2d = tuple(args.chunk_2d) if args.chunk_2d is not None else (64, *mag_shape)
+    chunk_align = math.lcm(int(chunk_3d[0]), int(chunk_2d[0]))
 
     if Blosc is None:
         raise SystemExit("Blosc codec unavailable; cannot create compressed Zarr.")
@@ -279,21 +292,59 @@ def main() -> None:
         serializer=VLenUTF8Codec(),
     )
 
-    tasks = []
+    parallel_tasks: List[Tuple[str, str, int, int, int, int, int]] = []
+    remainder_tasks: List[Tuple[str, str, int, int, int, int, int]] = []
     offset = 0
     for path, sample_count in zarr_infos:
-        tasks.append((path, args.output, offset, args.batch_size, args.blosc_threads))
+        # How many full chunks can we copy from this store?
+        aligned_count = (sample_count // chunk_align) * chunk_align
+        remainder_count = sample_count - aligned_count
+
+        if aligned_count > 0:
+            # The aligned portion can be parallelized
+            parallel_tasks.append(
+                (
+                    path,
+                    args.output,
+                    offset,
+                    0,
+                    aligned_count,
+                    args.batch_size,
+                    args.blosc_threads,
+                )
+            )
+
+        if remainder_count > 0:
+            # The remainder (< chunk_align samples) must be serialized
+            remainder_tasks.append(
+                (
+                    path,
+                    args.output,
+                    offset,
+                    aligned_count,
+                    sample_count,
+                    args.batch_size,
+                    args.blosc_threads,
+                )
+            )
+
         offset += sample_count
 
-    if args.workers > 1:
+    # Copy aligned portions in parallel
+    if args.workers > 1 and parallel_tasks:
         with ProcessPoolExecutor(max_workers=args.workers) as executor:
             for _ in _iter_with_progress(
-                executor.map(_copy_store_worker, tasks), "Copying zarrs"
+                executor.map(_copy_store_worker, parallel_tasks),
+                "Copying zarrs (aligned)",
             ):
                 pass
     else:
-        for task in _iter_with_progress(tasks, "Copying zarrs"):
+        for task in _iter_with_progress(parallel_tasks, "Copying zarrs (aligned)"):
             _copy_store_worker(task)
+
+    # Copy remainder portions serially (these are small, < chunk_align each)
+    for task in _iter_with_progress(remainder_tasks, "Copying zarrs (remainders)"):
+        _copy_store_worker(task)
 
     offset = 0
     for path, sample_count in _iter_with_progress(zarr_infos, "Writing metadata"):

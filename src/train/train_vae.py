@@ -147,6 +147,18 @@ def parse_args() -> argparse.Namespace:
         default="config/train_vae.yaml",
         help="Path to YAML config file.",
     )
+    parser.add_argument(
+        "--resume_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a checkpoint to resume from.",
+    )
+    parser.add_argument(
+        "--wandb_resume_id",
+        type=str,
+        default=None,
+        help="Optional W&B run id to resume. If not provided, uses id from checkpoint when available.",
+    )
     # CLI overrides for sweep/grid search
     parser.add_argument(
         "--kl_weight", type=float, default=None, help="Override kl_weight from config"
@@ -158,9 +170,16 @@ def parse_args() -> argparse.Namespace:
     if not isinstance(config, dict):
         raise ValueError(f"Config must be a mapping/dict: {cli_args.config}")
 
+    config.setdefault("resume_checkpoint", None)
+    config.setdefault("wandb_resume_id", None)
+
     # Apply CLI overrides
     if cli_args.kl_weight is not None:
         config["kl_weight"] = cli_args.kl_weight
+    if cli_args.resume_checkpoint is not None:
+        config["resume_checkpoint"] = cli_args.resume_checkpoint
+    if cli_args.wandb_resume_id is not None:
+        config["wandb_resume_id"] = cli_args.wandb_resume_id
 
     return argparse.Namespace(**config)
 
@@ -284,6 +303,19 @@ def main() -> None:
         model, optimizer, train_loader, val_loader, test_loader
     )
 
+    resume_checkpoint = args.resume_checkpoint
+    resume_data = None
+    if resume_checkpoint is not None:
+        resume_path = Path(resume_checkpoint)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        if accelerator.is_main_process:
+            logger.info("Resuming from checkpoint: %s", resume_path)
+        resume_data = torch.load(resume_path, map_location="cpu", weights_only=False)
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.load_state_dict(resume_data["model_state_dict"])
+        optimizer.load_state_dict(resume_data["optimizer_state_dict"])
+
     # Print number of parameters
     if accelerator.is_main_process:
         logger.info(
@@ -295,6 +327,11 @@ def main() -> None:
 
     wandb_run = None
     if accelerator.is_main_process:
+        resume_id = None
+        if args.wandb_resume_id:
+            resume_id = args.wandb_resume_id
+        elif isinstance(resume_data, dict):
+            resume_id = resume_data.get("wandb_run_id")
         init_kwargs = {
             "project": os.getenv("WANDB_PROJECT", "maggrav-vae"),
             "config": {
@@ -304,6 +341,9 @@ def main() -> None:
                 "test_size": test_size,
             },
         }
+        if resume_id:
+            init_kwargs["id"] = resume_id
+            init_kwargs["resume"] = "allow"
         run_name = os.getenv("WANDB_RUN_NAME")
         if run_name:
             init_kwargs["name"] = run_name
@@ -313,6 +353,8 @@ def main() -> None:
         logger.info("Training for %d samples", args.max_steps)
 
     global_samples = 0
+    if isinstance(resume_data, dict) and "global_samples" in resume_data:
+        global_samples = int(resume_data["global_samples"])
     best_val_loss = float("inf")
     best_path = output_dir / "vae_best.json"
     log_samples = 0
@@ -324,9 +366,14 @@ def main() -> None:
     eval_recon_sum = 0.0
     eval_kl_sum = 0.0
 
-    next_log = args.log_every
-    next_eval = args.eval_every_steps
-    next_save = args.save_every
+    def next_multiple(step: int, interval: int) -> int:
+        if interval <= 0:
+            return step
+        return ((step // interval) + 1) * interval
+
+    next_log = next_multiple(global_samples, args.log_every)
+    next_eval = next_multiple(global_samples, args.eval_every_steps)
+    next_save = next_multiple(global_samples, args.save_every)
     last_saved_step = 0
 
     epoch = 0
@@ -334,6 +381,8 @@ def main() -> None:
     progress_bar = None
     if args.progress and accelerator.is_local_main_process:
         progress_bar = tqdm(total=args.max_steps, desc="Training", leave=True)
+        if global_samples > 0:
+            progress_bar.update(global_samples)
 
     profile_window = args.profile and accelerator.is_main_process
     window_data_time = 0.0
@@ -534,6 +583,7 @@ def main() -> None:
                     "config": model_cfg,
                     "args": vars(args),
                     "stats_path": str(stats_path),
+                    "wandb_run_id": wandb_run.id if wandb_run is not None else None,
                 }
                 checkpoint_path = (
                     output_dir / f"vae_checkpoint_step_{global_samples}.pt"
@@ -577,6 +627,7 @@ def main() -> None:
                 "config": model_cfg,
                 "args": vars(args),
                 "stats_path": str(stats_path),
+                "wandb_run_id": wandb_run.id if wandb_run is not None else None,
             }
             checkpoint_path = output_dir / f"vae_checkpoint_step_{global_samples}.pt"
             torch.save(checkpoint, checkpoint_path)
