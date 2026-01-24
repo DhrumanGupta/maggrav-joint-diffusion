@@ -1,7 +1,7 @@
 # Single source of truth for VAE training (mirrors src/train_diffusion.py style)
 
 # Data
-zarr_path: /scratch/dhruman_gupta/noddyverse_preprocessed/output-final-old
+zarr_path: /workspace/noddyverse/output-final
 stats_path: ./vae_stats.json
 recompute_stats: false
 num_workers: 8
@@ -10,14 +10,14 @@ stats_batch_size: 32
 # Model
 # Note: downsample_factor controls latent spatial size; must be compatible with your input size.
 downsample_factor: 8
-base_channels: 24
-latent_channels: 32
-blocks_per_stage: 2
+base_channels: 12
+latent_channels: 16
+blocks_per_stage: 1
 
 # Training
 batch_size: 1
 lr: 1.0e-4
-kl_weight: 1.0e-4
+kl_weight: 1.0e-3
 
 # KL warmup (in samples processed): KL weight ramps 0 -> kl_weight over this many samples.
 kl_warmup_steps: 500000
