@@ -1,0 +1,66 @@
+# EDM BiFlowNet diffusion model training configuration
+
+# Data
+latents_zarr: zarrs/encoded-latents_0.01.zarr
+# latents_zarr: /scratch/dhruman_gupta/noddyverse_preprocessed/output-latents.zarr
+num_workers: 8
+pad_to: 32
+no_logvar: true
+
+# Stats (latent normalization)
+stats_path: latent_stats_0.01_vae.json  # auto-generates in output_dir if null
+recompute_stats: false
+stats_batch_size: 64
+use_single_vae_scaling: true  # If true, use global std across channels instead of per-channel
+
+# Model (BiFlowNet)
+model_dim: 32
+dim_mults: [1, 1, 2, 4]
+use_attn: [0, 0, 0, 1]
+patch_size: 1
+sub_volume_size: 8
+vq_size: 64
+num_mid_dit: 1
+attn_heads: 8
+dit_num_heads: 8
+resnet_groups: 16
+mlp_ratio: 2.0
+init_kernel_size: 3
+
+# EDM-specific parameters
+sigma_data: 1.0
+sigma_min: 0.002
+sigma_max: 80.0
+rho: 7.0
+P_mean: -1.2
+P_std: 1.2
+
+# Training
+batch_size: 24
+lr: 5.0e-5
+grad_clip: 1.0
+seed: 42
+gradient_accumulation_steps: 1
+warmup_samples: 1500000
+max_steps: 50000000
+
+# Evaluation
+eval_every_steps: 250000
+num_eval_samples: 4
+num_eval_steps: 64
+decode_batch_size: 4
+
+# Decode (VAE)
+vae_checkpoint: outputs/vae_attention_sweep/kl_weight_0.01/vae_attention_checkpoint_step_1000020.pt
+vae_stats_path: vae_stats.json  # optional override; uses checkpoint stats_path if null
+data_original_size: null  # center-crop decoded volumes to this size (set null to disable)
+save_decoded_samples: true
+num_save_samples: 4
+decoded_dtype: float32
+
+# Output
+output_dir: outputs/edm_biflownet_global_std
+run_name: edm_biflownet_global_std
+save_every: 250000
+log_every: 4096
+progress: false

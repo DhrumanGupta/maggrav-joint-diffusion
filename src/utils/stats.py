@@ -54,3 +54,58 @@ def reshape_stats_for_broadcast(
     mean = stats["mean"].float().view(*shape)
     std = stats["std"].float().view(*shape)
     return mean, std
+
+
+def get_effective_std(
+    stats: Dict[str, torch.Tensor],
+    use_logvar: bool,
+) -> torch.Tensor:
+    """
+    Return std for normalization, optionally accounting for logvar sampling.
+
+    When sampling z = mu + exp(0.5 * logvar) * eps, total variance is:
+        Var[z] = Var[mu] + E[exp(logvar)]
+    """
+    std = stats["std"].float()
+    if use_logvar:
+        if "mean_exp_logvar" not in stats:
+            raise ValueError(
+                "mean_exp_logvar missing in stats; recompute latent stats with logvar."
+            )
+        variance = std.pow(2) + stats["mean_exp_logvar"].float()
+        std = torch.sqrt(variance.clamp_min(0))
+    return std
+
+
+def get_global_std(
+    stats: Dict[str, torch.Tensor],
+    use_logvar: bool = False,
+) -> torch.Tensor:
+    """
+    Compute global (scalar) standard deviation across all channels.
+    
+    This computes a single std value from per-channel stats by:
+    1. Computing effective variance per channel (accounting for logvar if needed)
+    2. Taking the mean of variances across channels
+    3. Taking sqrt to get global std
+    
+    Args:
+        stats: Dictionary with 'mean', 'std' tensors (and optionally 'mean_exp_logvar').
+        use_logvar: If True, account for VAE sampling variance.
+    
+    Returns:
+        Single scalar tensor with global std.
+        
+    Example:
+        Given per-channel std [0.217, 0.631]:
+        Global std = sqrt(mean([0.217², 0.631²])) = sqrt(0.2226) ≈ 0.472
+    """
+    # Get per-channel effective std
+    per_channel_std = get_effective_std(stats, use_logvar)
+    
+    # Compute global std from mean of per-channel variances
+    per_channel_variance = per_channel_std.pow(2)
+    global_variance = per_channel_variance.mean()
+    global_std = torch.sqrt(global_variance.clamp_min(0))
+    
+    return global_std

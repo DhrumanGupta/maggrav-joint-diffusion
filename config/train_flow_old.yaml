@@ -1,41 +1,46 @@
 # Diffusion model training configuration
 
 # Data
-latents_zarr: zarrs/encoded-latents-attention-sweep-3.zarr
+latents_zarr: /scratch/dhruman_gupta/noddyverse_preprocessed/encoded_latents.zarr
 num_workers: 8
-no_logvar: true
+no_logvar: false
+pad_to: 32
 
 # Stats (latent normalization)
-stats_path: cache/vae-sweep-3-latent_stats.json  # auto-generates in output_dir if null
+stats_path: null  # auto-generates in output_dir if null
 recompute_stats: false
 stats_batch_size: 32
 use_single_vae_scaling: false  # If true, use global std across channels instead of per-channel
 
 # Model
-base_channels: 16
-num_res_blocks: 4
+base_channels: 64
+num_res_blocks: 2
 num_heads: 4
 channel_mults: [1, 2, 4, 8]
-attn_levels: [1, 2, 3]
-dropout: 0.05
+attn_levels: [2, 3]
+dropout: 0.0
+
+# Timestep sampling (logit-normal distribution)
+logit_mean: 0.0
+logit_std: 1.0
 
 # Training
-batch_size: 64
-lr: 5.0e-5
+batch_size: 32
+lr: 1.0e-4
 grad_clip: 1.0
 seed: 42
 gradient_accumulation_steps: 1
-warmup_samples: 150000
-max_steps: 5000000
+warmup_samples: 1000000
+max_steps: 150000000
 
 # Evaluation
 eval_every_steps: 250000
-num_eval_samples: 1
+num_eval_samples: 32
 num_eval_steps: 64
 
 # Output
-output_dir: outputs/flow_lg_10_overfit
-run_name: flow_lg_10_overfit
+output_dir: outputs/flow_150m
+run_name: flow_150m
 save_every: 250000
 log_every: 5000
 progress: false

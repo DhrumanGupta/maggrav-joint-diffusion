@@ -1,0 +1,153 @@
+{
+  "volume_shape": [
+    200,
+    200,
+    200
+  ],
+  "channels": {
+    "density": {
+      "count": 1600000000000.0,
+      "mean": 2.7652035165595996,
+      "std": 0.2112278785447398,
+      "min": 0.6849939823150635,
+      "max": 5.451056957244873,
+      "skewness": 1.0170423646251534,
+      "excess_kurtosis": 6.676897456913771,
+      "fraction_positive": 1.0,
+      "fraction_negative": 0.0,
+      "fraction_zero": 0.0,
+      "log1p": {
+        "count": 1600000000000.0,
+        "mean": 1.3242661913728728,
+        "std": 0.05518465178994678,
+        "min": 0.5217620134353638,
+        "max": 1.864243984222412,
+        "skewness": 0.3822870888144191,
+        "excess_kurtosis": 6.1259968668514055,
+        "fraction_positive": 1.0,
+        "fraction_negative": 0.0,
+        "fraction_zero": 0.0,
+        "percentiles": {
+          "p001": 1.0383252502679825,
+          "p010": 1.1938553380966186,
+          "p050": 1.2488326966762542,
+          "p500": 1.3199950456619263,
+          "p950": 1.4106260359287262,
+          "p990": 1.4990418291091923,
+          "p999": 1.6157608441114408
+        }
+      },
+      "percentiles": {
+        "p001": 1.8244828126430512,
+        "p010": 2.2997783279418944,
+        "p050": 2.4862712383270265,
+        "p500": 2.7434029579162598,
+        "p950": 3.0985204815864558,
+        "p990": 3.477396807670595,
+        "p999": 4.031714768409721
+      }
+    },
+    "susceptibility": {
+      "count": 1600000000000.0,
+      "mean": -3.096611376857756,
+      "std": 1.0155666787950501,
+      "min": -6.0,
+      "max": 1.7775952816009521,
+      "skewness": 0.07340685463662758,
+      "excess_kurtosis": -0.21585625357116456,
+      "fraction_positive": 0.0010154985075,
+      "fraction_negative": 0.9989845014925,
+      "fraction_zero": 0.0,
+      "log1p": {
+        "count": 1600000000000.0,
+        "mean": 0.00024734294533323374,
+        "std": 0.009937803147953376,
+        "min": 0.0,
+        "max": 1.0215855836868286,
+        "skewness": 52.28609884849778,
+        "excess_kurtosis": 3231.3172684801866,
+        "fraction_positive": 0.0010154985075,
+        "fraction_negative": 0.0,
+        "fraction_zero": 0.9989845014925,
+        "percentiles": {
+          "p001": NaN,
+          "p010": NaN,
+          "p050": NaN,
+          "p500": NaN,
+          "p950": NaN,
+          "p990": NaN,
+          "p999": NaN
+        }
+      },
+      "percentiles": {
+        "p001": -6.0,
+        "p010": -5.397940158843994,
+        "p050": -4.744727611541748,
+        "p500": -3.0952844619750977,
+        "p950": -1.3941101908683784,
+        "p990": -0.7517912542819908,
+        "p999": -0.00026799183898184805
+      }
+    }
+  },
+  "timing": {
+    "num_batches": 25000,
+    "num_samples": 200000,
+    "num_voxels_per_channel": 1600000000000,
+    "loader_seconds": 66301.10952085396,
+    "compute_seconds": 3729.1145486212336,
+    "worker_wall_seconds": 17718.00723791588,
+    "per_rank": [
+      {
+        "rank": 0,
+        "num_batches": 6250,
+        "num_samples": 50000,
+        "num_voxels_per_channel": 400000000000,
+        "loader_seconds": 16683.155575159937,
+        "compute_seconds": 835.6930558392778,
+        "total_seconds": 17519.386913076974,
+        "samples_per_second": 2.853981149458978,
+        "voxels_per_second_per_channel": 22831849.195671823
+      },
+      {
+        "rank": 1,
+        "num_batches": 6250,
+        "num_samples": 50000,
+        "num_voxels_per_channel": 400000000000,
+        "loader_seconds": 16543.906694188714,
+        "compute_seconds": 1009.0630670879036,
+        "total_seconds": 17553.559470970184,
+        "samples_per_second": 2.8484251346679437,
+        "voxels_per_second_per_channel": 22787401.07734355
+      },
+      {
+        "rank": 2,
+        "num_batches": 6250,
+        "num_samples": 50000,
+        "num_voxels_per_channel": 400000000000,
+        "loader_seconds": 16347.251809572801,
+        "compute_seconds": 893.7021372993477,
+        "total_seconds": 17243.585337068886,
+        "samples_per_second": 2.8996289937750928,
+        "voxels_per_second_per_channel": 23197031.950200744
+      },
+      {
+        "rank": 3,
+        "num_batches": 6250,
+        "num_samples": 50000,
+        "num_voxels_per_channel": 400000000000,
+        "loader_seconds": 16726.79544193251,
+        "compute_seconds": 990.6562883947045,
+        "total_seconds": 17718.00723791588,
+        "samples_per_second": 2.8219877850033748,
+        "voxels_per_second_per_channel": 22575902.280027
+      }
+    ],
+    "postprocess_seconds": 0.023642225190997124,
+    "total_seconds": 17718.966153746936,
+    "device": "cuda",
+    "world_size": 4,
+    "samples_per_second": 11.287340258150843,
+    "voxels_per_second_per_channel": 90298722.06520675
+  }
+}

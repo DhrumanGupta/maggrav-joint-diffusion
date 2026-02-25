@@ -3,7 +3,7 @@
 # Data
 zarr_path: /scratch/dhruman_gupta/noddyverse_preprocessed/output-final-old
 stats_path: ./vae_stats.json
-recompute_stats: false
+recompute_stats: true
 num_workers: 8
 stats_batch_size: 32
 

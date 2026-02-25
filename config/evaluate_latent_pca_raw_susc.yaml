@@ -1,0 +1,17 @@
+latents_zarr: /scratch/dhruman_gupta/noddyverse_preprocessed/output-final-old/
+output_dir: outputs/latent_pca/raw
+batch_size: 64
+num_workers: 32
+n_components: 10
+# max_samples: 100000
+raw_field: susc
+
+use_filter_cache: true
+filter_cache_path: ./cache/train_filter_stats.pt
+
+susc_active_threshold_log10: -1.5
+min_active_frac: 0.001
+low_info_keep_prob: 0.02
+
+use_gpu: true
+num_gpus: 4

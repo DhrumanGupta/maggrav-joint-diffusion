@@ -11,3 +11,9 @@ wandb
 outputs*
 logs
 output-final*
+
+zarrs
+
+.DS_Store
+
+*.pt

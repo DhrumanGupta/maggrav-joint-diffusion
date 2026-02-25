@@ -236,6 +236,8 @@ def main() -> None:
             save_stats(stats_path, stats)
             logger.info(f"Saved stats to {stats_path}")
 
+    exit()
+
     accelerator.wait_for_everyone()
     stats = load_stats(stats_path)
 

@@ -4,17 +4,18 @@ EDM (Elucidating the Design Space of Diffusion-Based Generative Models) utilitie
 Implements preconditioning, loss, and sampling from Karras et al., 2022.
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
 from .unet import UNet3DDiffusion
+from .dit import DiT3D
 
 
 class EDMPrecond(nn.Module):
     """
-    EDM preconditioning wrapper for the UNet.
+    EDM preconditioning wrapper for the UNet or DiT.
 
     Implements the preconditioning from "Elucidating the Design Space of
     Diffusion-Based Generative Models" (Karras et al., 2022).
@@ -33,7 +34,7 @@ class EDMPrecond(nn.Module):
         sigma_data: Data standard deviation (default 0.5 for unnormalized, 1.0 for normalized).
     """
 
-    def __init__(self, model: UNet3DDiffusion, sigma_data: float = 0.5):
+    def __init__(self, model: Union[UNet3DDiffusion, DiT3D], sigma_data: float = 0.5):
         super().__init__()
         self.model = model
         self.sigma_data = sigma_data
@@ -73,6 +74,7 @@ def edm_loss(
     P_mean: float = -1.2,
     P_std: float = 1.2,
     sigma_data: float = 0.5,
+    return_per_sample: bool = False,
 ) -> torch.Tensor:
     """
     EDM training loss with log-normal sigma sampling.
@@ -95,7 +97,8 @@ def edm_loss(
         sigma_data: Data standard deviation.
 
     Returns:
-        Scalar loss tensor.
+        Scalar loss tensor by default. If ``return_per_sample`` is True,
+        returns a tensor of shape (B,) with per-sample losses.
     """
     batch_size = x.shape[0]
     device = x.device
@@ -125,15 +128,18 @@ def edm_loss(
 
     # Compute loss only on valid (non-padded) regions
     if mask is not None:
-        # Masked MSE loss: average over valid elements only
+        # Average per sample over valid voxels/channels, then average batch.
         diff_sq = (denoised - x) ** 2
         weighted_diff_sq = weight * diff_sq * mask
-        loss = weighted_diff_sq.sum() / mask.sum() / x.shape[1]  # normalize by channels
+        valid_per_sample = mask.sum() * x.shape[1]
+        per_sample_loss = weighted_diff_sq.sum(dim=(1, 2, 3, 4)) / valid_per_sample
     else:
         diff_sq = (denoised - x) ** 2
-        loss = (weight * diff_sq).mean()
+        per_sample_loss = (weight * diff_sq).mean(dim=(1, 2, 3, 4))
 
-    return loss
+    if return_per_sample:
+        return per_sample_loss
+    return per_sample_loss.mean()
 
 
 def get_karras_sigmas(
@@ -179,6 +185,7 @@ def sample_edm_heun(
     rho: float = 7.0,
     mask: Optional[torch.Tensor] = None,
     autocast_context=None,
+    autocast_fn=None,
 ) -> torch.Tensor:
     """
     Heun's 2nd-order deterministic sampler for EDM.
@@ -196,7 +203,10 @@ def sample_edm_heun(
         sigma_max: Maximum noise level.
         rho: Schedule curvature parameter.
         mask: Optional mask for valid regions.
-        autocast_context: Optional autocast context manager (e.g., accelerator.autocast()).
+        autocast_context: Optional autocast context manager.
+            Note: this should only be used for single-use contexts.
+        autocast_fn: Optional callable returning an autocast context manager
+            (e.g., accelerator.autocast). Preferred for iterative sampling loops.
 
     Returns:
         Generated samples tensor (B, C, D, H, W).
@@ -221,7 +231,10 @@ def sample_edm_heun(
 
         # Get denoised estimate at current sigma
         sigma_batch = sigma_cur.expand(num_samples)
-        if autocast_context is not None:
+        if autocast_fn is not None:
+            with autocast_fn():
+                denoised = model(x, sigma_batch)
+        elif autocast_context is not None:
             with autocast_context:
                 denoised = model(x, sigma_batch)
         else:
@@ -236,7 +249,10 @@ def sample_edm_heun(
         # Heun correction (if not at final step)
         if sigma_next > 0:
             sigma_batch_next = sigma_next.expand(num_samples)
-            if autocast_context is not None:
+            if autocast_fn is not None:
+                with autocast_fn():
+                    denoised_next = model(x_next, sigma_batch_next)
+            elif autocast_context is not None:
                 with autocast_context:
                     denoised_next = model(x_next, sigma_batch_next)
             else:

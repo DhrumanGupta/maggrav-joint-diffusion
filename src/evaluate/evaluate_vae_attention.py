@@ -1,8 +1,8 @@
 """
-Evaluate a 3D VAE on the test split.
+Evaluate a 3D VAE with attention on the test split.
 
 Usage:
-    python src/evaluate_vae.py --zarr_path /path/to/zarr --checkpoint /path/to/ckpt.pt
+    python -m src.evaluate.evaluate_vae_attention --zarr_path /path/to/zarr --checkpoint /path/to/ckpt.pt
 """
 
 import argparse
@@ -19,22 +19,13 @@ from accelerate import Accelerator
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
-from ..models.vae import VAE3D, VAE3DConfig
+from ..models.vae_attention import VAE3DAttention, VAE3DAttentionConfig
 from ..utils.checkpoint import clean_state_dict, load_checkpoint
 from ..utils.datasets import JointDensitySuscDataset
 from ..utils.stats import load_stats
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-# Padding constants: original data is 200³, pad to 256³ for nice latent dimensions
-ORIGINAL_SIZE = 200
-PADDED_SIZE = 256
-PAD_AMOUNT = (PADDED_SIZE - ORIGINAL_SIZE) // 2  # 28 on each side
-DOWNSAMPLE_FACTOR = 8  # Must match config
-# Latent padding: use ceil to ensure we only include fully-valid latent positions
-LATENT_PAD = (PAD_AMOUNT + DOWNSAMPLE_FACTOR - 1) // DOWNSAMPLE_FACTOR  # 4
-LATENT_VALID_SIZE = (PADDED_SIZE // DOWNSAMPLE_FACTOR) - 2 * LATENT_PAD  # 24
 
 logging.basicConfig(
     format="%(asctime)s %(message)s",
@@ -44,47 +35,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def pad_to_256(x: torch.Tensor) -> torch.Tensor:
-    """Pad input from (B, C, 200, 200, 200) to (B, C, 256, 256, 256) with zeros."""
-    return F.pad(
-        x, (PAD_AMOUNT, PAD_AMOUNT, PAD_AMOUNT, PAD_AMOUNT, PAD_AMOUNT, PAD_AMOUNT)
-    )
+def mse_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Compute MSE loss on full 200³ volume."""
+    return F.mse_loss(recon, target)
 
 
-def extract_valid_region(x: torch.Tensor) -> torch.Tensor:
-    """Extract the original 200³ region from a 256³ tensor."""
-    return x[
-        :,
-        :,
-        PAD_AMOUNT : PAD_AMOUNT + ORIGINAL_SIZE,
-        PAD_AMOUNT : PAD_AMOUNT + ORIGINAL_SIZE,
-        PAD_AMOUNT : PAD_AMOUNT + ORIGINAL_SIZE,
-    ]
-
-
-def masked_mse_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Compute MSE loss only on the valid 200³ region."""
-    recon_valid = extract_valid_region(recon)
-    target_valid = extract_valid_region(target)
-    return F.mse_loss(recon_valid, target_valid)
-
-
-def extract_valid_latent_region(x: torch.Tensor) -> torch.Tensor:
-    """Extract the latent region corresponding to valid input data.
-
-    With 8x downsampling and 28-pixel padding, the valid latent region
-    is [4:-4] in each spatial dimension (24³ out of 32³).
-    """
-    return x[
-        :, :, LATENT_PAD:-LATENT_PAD, LATENT_PAD:-LATENT_PAD, LATENT_PAD:-LATENT_PAD
-    ]
-
-
-def masked_kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    """Compute KL loss only on the valid latent region."""
-    mu_valid = extract_valid_latent_region(mu)
-    logvar_valid = extract_valid_latent_region(logvar)
-    return -0.5 * torch.mean(1 + logvar_valid - mu_valid.pow(2) - logvar_valid.exp())
+def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    """Compute KL divergence loss on full latent."""
+    return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
 
 def normalize(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
@@ -92,15 +50,13 @@ def normalize(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.T
     return (x - mean) / std
 
 
-def denormalize(
-    x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
-) -> torch.Tensor:
+def denormalize(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     """Inverse of `normalize`."""
     return x * std + mean
 
 
 def decode_for_taus(
-    vae: VAE3D,
+    vae: torch.nn.Module,
     mu: torch.Tensor,
     taus: List[float],
     accelerator: Accelerator,
@@ -133,9 +89,7 @@ def compute_channel_plot_bounds(
 
     for c in range(num_channels):
         sc = np.nan_to_num(sample_np[c], nan=0.0, posinf=0.0, neginf=0.0)
-        rc_all = np.nan_to_num(
-            all_recon_np[:, c], nan=0.0, posinf=0.0, neginf=0.0
-        )
+        rc_all = np.nan_to_num(all_recon_np[:, c], nan=0.0, posinf=0.0, neginf=0.0)
         vmin_per_ch[c] = float(min(sc.min(), rc_all.min()))
         vmax_per_ch[c] = float(max(sc.max(), rc_all.max()))
         diff_bound_per_ch[c] = 0.0
@@ -219,18 +173,47 @@ def _plot_recon_slices(
     plt.close(fig)
 
 
+def _plot_latent_slices(
+    latent_mu: torch.Tensor,
+    output_path: Path,
+    z_indices: list[int],
+) -> None:
+    """Plot slices of the latent mean across all channels."""
+    latent_np = latent_mu.detach().cpu().float().numpy()  # (C, D, H, W)
+    num_channels = latent_np.shape[0]
+    num_cols = len(z_indices)
+    num_rows = num_channels
+
+    fig, axes = plt.subplots(
+        num_rows,
+        num_cols,
+        figsize=(1.8 * num_cols, 2.0 * num_rows),
+        squeeze=False,
+    )
+
+    for c in range(num_channels):
+        for col, z in enumerate(z_indices):
+            ax = axes[c, col]
+            z_clamped = max(0, min(z, latent_np.shape[1] - 1))
+            ax.imshow(latent_np[c, z_clamped], cmap="viridis")
+            ax.set_title(f"ch{c} z={z_clamped}", fontsize=8)
+            ax.axis("off")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate 3D VAE on test split")
+    parser = argparse.ArgumentParser(
+        description="Evaluate 3D VAE with attention on test split"
+    )
     parser.add_argument("--zarr_path", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--stats_path", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument(
-        "--plot",
-        action="store_true",
-        help="Save sample/reconstruction/diff slices for z=0..200.",
-    )
     parser.add_argument(
         "--num_samples",
         type=int,
@@ -238,11 +221,25 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap on number of test samples to evaluate.",
     )
     parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Save sample/reconstruction/diff slices for z=0..200.",
+    )
+    parser.add_argument(
         "--taus",
         type=float,
         nargs="+",
         default=[0.0],
-        help="List of taus for decoding z = mu + eps*tau (eps ~ N(0,1)). Example: --taus 0 0.5 1.0",
+        help=(
+            "List of taus for decoding z = mu + eps*tau (eps ~ N(0,1)). "
+            "Example: --taus 0 0.5 1.0"
+        ),
+    )
+    parser.add_argument(
+        "--num_to_plot",
+        type=int,
+        default=10,
+        help="Number of test samples to plot (when --plot). Each sample gets one set of tau plots.",
     )
     return parser.parse_args()
 
@@ -253,25 +250,16 @@ def evaluate(
     dataloader: DataLoader,
     mean: torch.Tensor,
     std: torch.Tensor,
-    num_samples: Optional[int],
     accelerator: Accelerator,
-    taus: List[float],
 ) -> Dict[str, Any]:
+    """Evaluate reconstruction and KL loss on the provided dataloader."""
     model.eval()
-    vae = accelerator.unwrap_model(model)
-
     device = accelerator.device
+
+    total_recon = torch.tensor(0.0, device=device)
     total_kl = torch.tensor(0.0, device=device)
     total_samples = torch.tensor(0.0, device=device)
-    # Per-tau: total_recon and ratio_sum
-    total_recon_per_tau = {t: torch.tensor(0.0, device=device) for t in taus}
-    ratio_sum_per_tau = {
-        t: torch.zeros(2, dtype=torch.float32, device=device) for t in taus
-    }
 
-    eps_numerical = 1e-8
-    # Reproducible per-tau metrics: one eps per batch, shared across taus
-    torch.manual_seed(42)
     progress = tqdm(
         dataloader,
         desc="Evaluating",
@@ -280,65 +268,31 @@ def evaluate(
     )
     for batch in progress:
         batch = batch.to(device, non_blocking=True)
+        batch = normalize(batch, mean, std)
 
-        # Normalize then pad to 256³
-        batch_norm = normalize(batch, mean, std)
-        batch_padded = pad_to_256(batch_norm)
         with accelerator.autocast():
-            mu, logvar = vae.encode(batch_padded)
-        kl_loss = masked_kl_loss(mu, logvar)
+            recon, mu, logvar = model(batch)
+            recon_l = mse_loss(recon, batch)
+            kl_l = kl_loss(mu, logvar)
+
         batch_size = batch.size(0)
         total_samples += batch_size
-        total_kl += kl_loss.detach() * batch_size
+        total_recon += recon_l.detach() * batch_size
+        total_kl += kl_l.detach() * batch_size
 
-        # One eps per batch, shared across taus (same noise, different scale)
-        batch_denorm = denormalize(batch_norm, mean, std)
-        recons_per_tau = decode_for_taus(vae, mu, taus, accelerator)
-
-        for tau in taus:
-            recon_tau = recons_per_tau[tau]
-            recon_loss = masked_mse_loss(recon_tau, batch_padded)
-            total_recon_per_tau[tau] += recon_loss.detach() * batch_size
-
-            recon_valid = extract_valid_region(recon_tau)
-            recon_denorm = denormalize(recon_valid, mean, std)
-            diff = recon_denorm - batch_denorm
-            mse = diff.pow(2).mean(dim=(2, 3, 4))
-            l2 = batch_denorm.pow(2).sum(dim=(2, 3, 4)).sqrt()
-            ratio = mse / (l2 + eps_numerical)
-            ratio_sum_per_tau[tau] += ratio.sum(dim=0)
-
+    total_recon = accelerator.reduce(total_recon, reduction="sum")
     total_kl = accelerator.reduce(total_kl, reduction="sum")
     total_samples = accelerator.reduce(total_samples, reduction="sum")
-    for tau in taus:
-        total_recon_per_tau[tau] = accelerator.reduce(
-            total_recon_per_tau[tau], reduction="sum"
-        )
-        ratio_sum_per_tau[tau] = accelerator.reduce(
-            ratio_sum_per_tau[tau], reduction="sum"
-        )
 
     if total_samples.item() == 0:
         return {
+            "recon_loss": torch.tensor(0.0, device=device),
             "kl_loss": torch.tensor(0.0, device=device),
-            "per_tau": [
-                {
-                    "tau": t,
-                    "recon_loss": torch.tensor(0.0, device=device),
-                    "ratio_pct": torch.zeros(2, device=device),
-                }
-                for t in taus
-            ],
         }
 
-    avg_kl = total_kl / total_samples
-    per_tau = []
-    for tau in taus:
-        avg_recon = total_recon_per_tau[tau] / total_samples
-        ratio_avg = ratio_sum_per_tau[tau] / total_samples
-        ratio_pct = ratio_avg * 100.0
-        per_tau.append({"tau": tau, "recon_loss": avg_recon, "ratio_pct": ratio_pct})
-    return {"kl_loss": avg_kl, "per_tau": per_tau}
+    recon_avg = total_recon / total_samples
+    kl_avg = total_kl / total_samples
+    return {"recon_loss": recon_avg, "kl_loss": kl_avg}
 
 
 def main() -> None:
@@ -347,7 +301,7 @@ def main() -> None:
     device = accelerator.device
 
     checkpoint_path = Path(args.checkpoint)
-    checkpoint = load_checkpoint(checkpoint_path, device, [VAE3DConfig])
+    checkpoint = load_checkpoint(checkpoint_path, device, [VAE3DAttentionConfig])
 
     stats_path = (
         Path(args.stats_path)
@@ -368,7 +322,7 @@ def main() -> None:
     std = stats["std"].float().view(1, 2, 1, 1, 1).to(device)
 
     model_cfg = checkpoint["config"]
-    model = VAE3D(model_cfg)
+    model = VAE3DAttention(model_cfg)
     state_dict = clean_state_dict(checkpoint["model_state_dict"])
     model.load_state_dict(state_dict)
     model.to(device)
@@ -414,74 +368,104 @@ def main() -> None:
     else:
         logger.info("Evaluating full test split (%d samples)", len(test_subset))
 
-    metrics = evaluate(
-        model, test_loader, mean, std, args.num_samples, accelerator, args.taus
-    )
+    metrics = evaluate(model, test_loader, mean, std, accelerator)
 
     if accelerator.is_main_process:
+        logger.info("Recon loss: %.6f", metrics["recon_loss"].item())
         logger.info("KL loss: %.6f", metrics["kl_loss"].item())
-        for entry in metrics["per_tau"]:
-            tau = entry["tau"]
-            recon_loss = entry["recon_loss"]
-            ratio_pct = entry["ratio_pct"]
-            logger.info(
-                "tau=%.2f: Recon loss: %.6f | Per-channel MSE/L2 %%: channel0=%.4f%% | channel1=%.4f%%",
-                tau,
-                recon_loss.item(),
-                ratio_pct[0].item(),
-                ratio_pct[1].item(),
-            )
         if args.plot:
             if len(test_subset) == 0:
                 logger.info("No test samples available for plotting.")
             else:
                 model.eval()
-                # Use fixed first test index so the same sample is plotted for all taus
-                first_test_idx = train_size + val_size
-                sample = dataset[first_test_idx].unsqueeze(0).to(device)
-                sample_norm = (sample - mean) / std
-                sample_padded = pad_to_256(sample_norm)
                 vae = accelerator.unwrap_model(model)
-                with torch.no_grad():
-                    with accelerator.autocast():
-                        mu, _ = vae.encode(sample_padded)
-                depth = sample.shape[2]
+                depth = dataset[0].shape[1]  # (C, D, H, W)
                 z_max = min(200, depth - 1)
                 z_indices = list(range(0, z_max + 1, 10))
                 plot_dir = checkpoint_path.parent / "eval_plots"
-                sample_plot = sample.clone()
-                sample_plot[:, 1:2] = torch.pow(10.0, sample_plot[:, 1:2]) - 1e-6
+                n_plot = min(args.num_to_plot, len(test_subset))
 
-                # Build all recons for all taus (same sample, same eps across taus)
-                torch.manual_seed(42)
-                recons_per_tau = decode_for_taus(vae, mu, args.taus, accelerator)
+                for plot_idx in range(n_plot):
+                    # Prepare per-sample directory
+                    sample_dir = plot_dir / f"sample_{plot_idx}"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
 
-                recons_denorm_list = []
-                for tau in args.taus:
-                    recon = recons_per_tau[tau]
-                    recon_valid = extract_valid_region(recon)
-                    recon_denorm = denormalize(recon_valid, mean, std)
-                    recon_denorm[:, 1:2] = torch.pow(10.0, recon_denorm[:, 1:2]) - 1e-6
-                    recons_denorm_list.append(recon_denorm[0])
+                    test_idx = train_size + val_size + plot_idx
+                    sample = dataset[test_idx].unsqueeze(0).to(device)
+                    sample_norm = normalize(sample, mean, std)
+                    with torch.no_grad():
+                        with accelerator.autocast():
+                            mu, logvar = vae.encode(sample_norm)
 
-                # Global color scale: same vmin/vmax/diff_bound across sample and all taus
-                vmin_per_ch, vmax_per_ch, diff_bound_per_ch = compute_channel_plot_bounds(
-                    sample_plot[0], recons_denorm_list
-                )
+                    # Plot latent mean slices (all channels) for this sample
+                    latent_depth = mu.shape[2]
+                    max_cols = 5
+                    if latent_depth <= max_cols:
+                        z_lat_indices = list(range(latent_depth))
+                    else:
+                        step = math.ceil(latent_depth / max_cols)
+                        z_lat_indices = list(range(0, latent_depth, step))
 
-                for tau, recon_denorm_0 in zip(args.taus, recons_denorm_list):
-                    plot_path = plot_dir / f"vae_recon_slices_tau_{tau}.png"
-                    _plot_recon_slices(
-                        sample_plot[0],
-                        recon_denorm_0,
-                        plot_path,
-                        z_indices,
-                        channel_names=("grav", "mag"),
-                        vmin_per_ch=vmin_per_ch,
-                        vmax_per_ch=vmax_per_ch,
-                        diff_bound_per_ch=diff_bound_per_ch,
+                    # Save latent mean and stochastic samples in a 'latents' subfolder
+                    latents_dir = sample_dir / "latents"
+                    latents_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Raw latent mean (mu)
+                    raw_path = latents_dir / "raw.png"
+                    _plot_latent_slices(
+                        mu[0],
+                        raw_path,
+                        z_lat_indices,
                     )
-                    logger.info("Saved recon slices to %s", plot_path)
+
+                    # Five stochastic latent samples: mu + exp(0.5 * logvar) * eps
+                    latent_std = torch.exp(0.5 * logvar)
+                    for i in range(5):
+                        eps = torch.randn_like(mu)
+                        z_sample = mu + latent_std * eps
+                        latent_sample_path = latents_dir / f"latent_{i}.png"
+                        _plot_latent_slices(
+                            z_sample[0],
+                            latent_sample_path,
+                            z_lat_indices,
+                        )
+
+                    sample_plot = sample.clone()
+                    sample_plot[:, 1:2] = torch.pow(10.0, sample_plot[:, 1:2]) - 1e-6
+
+                    # Build all recons for all taus (same sample, same eps across taus)
+                    torch.manual_seed(42 + plot_idx)
+                    recons_per_tau = decode_for_taus(vae, mu, args.taus, accelerator)
+
+                    recons_denorm_list = []
+                    for tau in args.taus:
+                        recon = recons_per_tau[tau]
+                        recon_denorm = denormalize(recon, mean, std)
+                        recon_denorm[:, 1:2] = (
+                            torch.pow(10.0, recon_denorm[:, 1:2]) - 1e-6
+                        )
+                        recons_denorm_list.append(recon_denorm[0])
+
+                    # Global color scale: same vmin/vmax/diff_bound across sample and all taus
+                    vmin_per_ch, vmax_per_ch, diff_bound_per_ch = (
+                        compute_channel_plot_bounds(sample_plot[0], recons_denorm_list)
+                    )
+
+                    for tau, recon_denorm_0 in zip(args.taus, recons_denorm_list):
+                        plot_path = (
+                            sample_dir / f"vae_attention_recon_slices_tau_{tau}.png"
+                        )
+                        _plot_recon_slices(
+                            sample_plot[0],
+                            recon_denorm_0,
+                            plot_path,
+                            z_indices,
+                            channel_names=("grav", "mag"),
+                            vmin_per_ch=vmin_per_ch,
+                            vmax_per_ch=vmax_per_ch,
+                            diff_bound_per_ch=diff_bound_per_ch,
+                        )
+                        logger.info("Saved recon slices to %s", plot_path)
 
 
 if __name__ == "__main__":

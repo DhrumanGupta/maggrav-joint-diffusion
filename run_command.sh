@@ -13,9 +13,14 @@ log_path="$2"
 log_dir="$(dirname "$log_path")"
 mkdir -p "$log_dir"
 
-source .venv/bin/activate
+# source ~/.bashrc
 
-nohup bash -lc "$command" > "$log_path" 2>&1 &
+# micromamba activate maggrav
+
+# nohup bash -lc "$command" > "$log_path" 2>&1 &
+
+nohup micromamba run -n maggrav bash -lc "$command" > "$log_path" 2>&1 &
+
 
 echo "Started: $command"
 echo "Logging to: $log_path"

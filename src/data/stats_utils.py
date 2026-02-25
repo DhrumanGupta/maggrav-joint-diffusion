@@ -206,7 +206,7 @@ def compute_latent_stats_ddp(
     num_workers: int,
     accelerator: Accelerator,
     num_channels: int,
-    pad_to: int = 32,
+    pad_to: int = 0,
     mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """
@@ -241,7 +241,7 @@ def compute_latent_stats_ddp(
     class LatentMuLogvarDataset(TorchDataset):
         def __init__(self, zarr_path: str, pad_to: int, return_logvar: bool):
             self.zarr_path = zarr_path
-            self.pad_to = pad_to
+            self.pad_to = max(pad_to, 1)
             self.return_logvar = return_logvar
             self._group = None
             self._mu_store = None
@@ -252,7 +252,7 @@ def compute_latent_stats_ddp(
             self.length = mu_store.shape[0]
             self.original_spatial = mu_store.shape[2:]
             self.padded_spatial = tuple(
-                max(dim, pad_to) for dim in self.original_spatial
+                max(dim, self.pad_to) for dim in self.original_spatial
             )
             self.pad_amounts = tuple(
                 padded - orig
@@ -273,7 +273,7 @@ def compute_latent_stats_ddp(
             pad_d, pad_h, pad_w = self.pad_amounts
             if pad_d == pad_h == pad_w == 0:
                 return tensor
-            return F.pad(tensor, (0, pad_w, 0, pad_h, 0, pad_d))
+            return F.pad(tensor, (0, self.pad_w, 0, self.pad_h, 0, self.pad_d))
 
         def __getitem__(self, idx):
             self._ensure_open()
@@ -361,10 +361,9 @@ def compute_latent_stats_ddp(
     mean = sum_ / count
     var_mu = sumsq / count - mean.pow(2)
 
-    # Total variance when sampling: Var[z] = Var[mu] + E[exp(logvar)]
+    # Store std for mu only; mean_exp_logvar is saved separately for optional sampling.
     mean_exp_logvar = sum_exp_logvar / count if has_logvar else torch.zeros_like(mean)
-    total_var = var_mu + mean_exp_logvar
-    std = torch.sqrt(total_var.clamp_min(0))
+    std = torch.sqrt(var_mu.clamp_min(0))
 
     return {
         "count": count.cpu(),

@@ -16,7 +16,7 @@ import argparse
 import logging
 import math
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -28,8 +28,12 @@ from ..models.edm import EDMPrecond, sample_edm_heun
 from ..models.unet import UNet3DConfig, UNet3DDiffusion
 from ..models.vae import VAE3D, VAE3DConfig
 from ..utils.checkpoint import clean_state_dict, load_checkpoint
-from ..utils.masking import create_padding_mask
 from ..utils.stats import load_stats
+
+# Real-space padding constants (matching train_vae.py)
+ORIGINAL_SIZE = 200
+PADDED_SIZE = 256
+PAD_AMOUNT = (PADDED_SIZE - ORIGINAL_SIZE) // 2  # 28 on each side
 
 logging.basicConfig(
     format="%(asctime)s %(message)s",
@@ -74,11 +78,15 @@ def _plot_sample_slices(
     plt.close(fig)
 
 
-def _crop_latents(
-    latents: torch.Tensor, target_shape: Tuple[int, int, int, int]
-) -> torch.Tensor:
-    channels, depth, height, width = target_shape
-    return latents[:, :channels, :depth, :height, :width]
+def _extract_valid_region(x: torch.Tensor) -> torch.Tensor:
+    """Extract the original 200³ region from a 256³ VAE output tensor."""
+    return x[
+        :,
+        :,
+        PAD_AMOUNT : PAD_AMOUNT + ORIGINAL_SIZE,
+        PAD_AMOUNT : PAD_AMOUNT + ORIGINAL_SIZE,
+        PAD_AMOUNT : PAD_AMOUNT + ORIGINAL_SIZE,
+    ]
 
 
 # -------------------------
@@ -106,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num_samples", type=int, required=True)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_steps", type=int, default=64)
+    parser.add_argument("--num_steps", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     # EDM-specific sampling parameters
     parser.add_argument(
@@ -135,6 +143,11 @@ def parse_args() -> argparse.Namespace:
         help="Device for VAE decoding (defaults to accelerator device if available).",
     )
     parser.add_argument("--output_dir", type=str, default="outputs_edm_samples")
+    parser.add_argument(
+        "--no_ema",
+        action="store_true",
+        help="Use raw training weights instead of EMA weights (not recommended)",
+    )
     return parser.parse_args()
 
 
@@ -178,8 +191,35 @@ def main() -> None:
     # Create EDMPrecond-wrapped model
     raw_model = UNet3DDiffusion(edm_cfg)
     edm_model = EDMPrecond(raw_model, sigma_data=sigma_data)
-    edm_state = clean_state_dict(edm_ckpt["model_state_dict"])
-    edm_model.load_state_dict(edm_state)
+    
+    # Load weights - prefer EMA weights for better sample quality
+    use_ema = not args.no_ema and "ema_state_dict" in edm_ckpt
+    if use_ema:
+        # EMAModel from diffusers stores weights in shadow_params
+        ema_state = edm_ckpt["ema_state_dict"]
+        if "shadow_params" in ema_state:
+            # shadow_params is a list of tensors matching model parameters
+            shadow_params = ema_state["shadow_params"]
+            for param, shadow in zip(edm_model.parameters(), shadow_params):
+                param.data.copy_(shadow)
+            if accelerator.is_main_process:
+                logger.info("Loaded EMA weights from checkpoint")
+        else:
+            # Fallback: try loading ema_state_dict directly as state dict
+            edm_state = clean_state_dict(ema_state)
+            edm_model.load_state_dict(edm_state)
+            if accelerator.is_main_process:
+                logger.info("Loaded EMA state dict from checkpoint")
+    else:
+        # Use raw training weights
+        edm_state = clean_state_dict(edm_ckpt["model_state_dict"])
+        edm_model.load_state_dict(edm_state)
+        if accelerator.is_main_process:
+            if args.no_ema:
+                logger.info("Using raw training weights (EMA disabled via --no_ema)")
+            else:
+                logger.warning("EMA weights not found in checkpoint, using raw training weights")
+    
     edm_model.to(device)
 
     # Load VAE stats (for denormalizing decoded outputs)
@@ -226,6 +266,8 @@ def main() -> None:
             )
 
     # Get latent shape - prefer from checkpoint, fallback to config
+    # With current pipeline: data is padded in real space (200³ -> 256³) before VAE,
+    # so latents are natively 32³ (256/8=32). No latent-space padding needed.
     if "latent_shape" in edm_ckpt:
         latent_shape = tuple(edm_ckpt["latent_shape"])
     else:
@@ -236,35 +278,16 @@ def main() -> None:
             edm_cfg.input_spatial,
         )
 
-    # Get original spatial dimensions for cropping and mask
-    if "original_spatial" in edm_ckpt:
-        original_spatial = tuple(edm_ckpt["original_spatial"])
-    else:
-        # Fallback for older checkpoints - assume no padding
-        original_spatial = latent_shape[1:]
+    if accelerator.is_main_process:
+        logger.info("Latent shape: %s", latent_shape)
 
-    # Create padding mask if there is padding
-    padding_mask = None
-    if original_spatial != latent_shape[1:]:
-        padding_mask = create_padding_mask(
-            padded_shape=latent_shape,
-            original_spatial=original_spatial,
-            device=device,
-        )
-        if accelerator.is_main_process:
-            logger.info(
-                "Padding mask created: original %s -> padded %s",
-                original_spatial,
-                latent_shape[1:],
-            )
-
-    z_depth = original_spatial[0]  # Use original depth for plotting
-    z_max = min(190, z_depth - 1)
+    # Compute z-slice indices for plotting (in real space, 200³)
+    z_max = min(190, ORIGINAL_SIZE - 1)
     z_indices = list(range(0, z_max + 1, 10))
     if z_indices[-1] != z_max:
         z_indices.append(z_max)
     if accelerator.is_main_process:
-        logger.info("Depth=%d, plotting slices: %s", z_depth, z_indices)
+        logger.info("Output depth=%d, plotting slices: %s", ORIGINAL_SIZE, z_indices)
 
     channel_names = ("grav", "mag")
     total = args.num_samples
@@ -287,13 +310,11 @@ def main() -> None:
     latent_dir = output_dir / "latents"
     latent_dir.mkdir(parents=True, exist_ok=True)
 
-    # Target shape for cropping (channels, D, H, W)
-    crop_target = (latent_shape[0],) + original_spatial
-
     if has_work:
         while generated < end_idx:
             batch = min(batch_size, end_idx - generated)
             with torch.no_grad():
+                # Sample latents at full 32³ resolution (no masking needed)
                 latents = sample_edm_heun(
                     edm_model,
                     num_samples=batch,
@@ -303,13 +324,11 @@ def main() -> None:
                     sigma_min=args.sigma_min,
                     sigma_max=args.sigma_max,
                     rho=args.rho,
-                    mask=padding_mask,
-                    autocast_context=accelerator.autocast(),
+                    autocast_fn=accelerator.autocast,
                 )
             # Denormalize latents back to original latent space
             if latent_mean is not None and latent_std is not None:
                 latents = latents * latent_std + latent_mean
-            latents = _crop_latents(latents, crop_target)
             for i in range(batch):
                 sample_idx = generated + i
                 latent_path = latent_dir / f"latent_{sample_idx:04d}.pt"
@@ -351,7 +370,10 @@ def main() -> None:
             latents = torch.stack(latent_batch, dim=0).to(decode_device)
             with torch.no_grad():
                 with accelerator.autocast():
+                    # VAE decode: 32³ latents -> 256³ output
                     decoded = vae.decode(latents)
+                # Extract valid 200³ region from 256³ output
+                decoded = _extract_valid_region(decoded)
                 # Denormalize VAE output back to original data space
                 decoded = decoded * vae_std + vae_mean
                 # Apply inverse log10 transformation to susceptibility channel (channel 1)

@@ -1,7 +1,9 @@
 # EDM diffusion model training configuration
 
 # Data
-latents_zarr: /scratch/dhruman_gupta/noddyverse_preprocessed/encoded_latents.zarr
+# latents_zarr: /scratch/dhruman_gupta/noddyverse_preprocessed/encoded_latents.zarr
+latents_zarr: output-latents.zarr
+# latents_zarr: /scratch/dhruman_gupta/noddyverse_preprocessed/output-latents.zarr
 num_workers: 8
 no_logvar: false
 pad_to: 32
@@ -10,6 +12,7 @@ pad_to: 32
 stats_path: null  # auto-generates in output_dir if null
 recompute_stats: false
 stats_batch_size: 32
+use_single_vae_scaling: false  # If true, use global std across channels instead of per-channel
 
 # Model
 base_channels: 64
@@ -17,7 +20,7 @@ num_res_blocks: 2
 num_heads: 4
 channel_mults: [1, 2, 4, 8]
 attn_levels: [2, 3]
-dropout: 0.0
+dropout: 0.1
 
 # EDM-specific parameters (replacing logit_mean, logit_std from rectified flow)
 sigma_data: 1.0      # Std of training data (1.0 since latents are normalized to unit variance)
@@ -29,21 +32,21 @@ P_std: 1.2           # Log-normal std for training sigma sampling
 
 # Training
 batch_size: 32
-lr: 1.0e-4
+lr: 5.0e-5
 grad_clip: 1.0
 seed: 42
 gradient_accumulation_steps: 1
-warmup_samples: 1000000
-max_steps: 150000000
+warmup_samples: 500000
+max_steps: 25000000
 
 # Evaluation
 eval_every_steps: 250000
-num_eval_samples: 32
-num_eval_steps: 64
+num_eval_samples: 64
+num_eval_steps: 128
 
 # Output
-output_dir: outputs/edm_150m
-run_name: edm_150m
+output_dir: outputs/edm_150m_new_vae_no_sample
+run_name: edm_150m_new_vae_no_sample
 save_every: 250000
 log_every: 5000
 progress: false

@@ -1,0 +1,28 @@
+# W&B Sweep config for VAE KL/latent width grid search
+# Usage:
+#   wandb sweep config/sweep_vae_attention.yaml
+#   wandb agent <sweep_id>
+
+project: maggrav-vae-attention
+program: src/train/train_vae_attention.py
+method: grid
+
+parameters:
+  kl_weight:
+    # values: [0.001, 0.005, 0.01]
+    values: [0.005, 0.01, 0.05]
+  # latent_channels:
+  #   values: [2, 4]
+
+env:
+  TORCHDYNAMO_DISABLE: "1"
+
+# Each agent should set CUDA_VISIBLE_DEVICES externally to a 2-GPU slice.
+command:
+  - accelerate
+  - launch
+  - -m
+  - src.train.train_vae_attention
+  - --config
+  - config/train_vae_attention_sweep.yaml
+  - ${args}

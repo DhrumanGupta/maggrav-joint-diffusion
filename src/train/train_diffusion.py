@@ -37,6 +37,7 @@ from ..models.edm import EDMPrecond, edm_loss, get_karras_sigmas, sample_edm_heu
 from ..models.unet import UNet3DConfig, UNet3DDiffusion
 from ..utils.datasets import LatentZarrDataset
 from ..utils.masking import create_padding_mask
+from ..utils.stats import get_effective_std, get_global_std
 
 logging.basicConfig(
     format="%(asctime)s %(message)s",
@@ -103,10 +104,11 @@ def main() -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
 
     pad_to = max(args.pad_to, 1)
+    use_logvar = not args.no_logvar
     dataset = LatentZarrDataset(
         args.latents_zarr,
         pad_to=pad_to,
-        use_logvar=not args.no_logvar,
+        use_logvar=use_logvar,
     )
     latent_channels, latent_spatial = _infer_latent_config(dataset)
 
@@ -153,14 +155,31 @@ def main() -> None:
 
     # Reshape mean/std for broadcasting: (1, C, 1, 1, 1)
     latent_mean = stats["mean"].float().view(1, latent_channels, 1, 1, 1)
-    latent_std = stats["std"].float().view(1, latent_channels, 1, 1, 1)
+    
+    # Compute std: either global (single value) or per-channel
+    if args.use_single_vae_scaling:
+        # Use global std across all channels
+        global_std = get_global_std(stats, use_logvar)
+        latent_std = global_std.view(1, 1, 1, 1, 1).expand(1, latent_channels, 1, 1, 1)
+    else:
+        # Use per-channel std (current behavior)
+        latent_std = get_effective_std(stats, use_logvar).view(
+            1, latent_channels, 1, 1, 1
+        )
 
     if accelerator.is_main_process:
-        logger.info(
-            "Latent stats - mean: %s, std: %s",
-            stats["mean"].tolist(),
-            stats["std"].tolist(),
-        )
+        if args.use_single_vae_scaling:
+            logger.info(
+                "Latent stats - mean: %s, global std: %.6f (single scaling mode)",
+                stats["mean"].tolist(),
+                latent_std[0, 0, 0, 0, 0].item(),
+            )
+        else:
+            logger.info(
+                "Latent stats - mean: %s, std: %s (per-channel scaling)",
+                stats["mean"].tolist(),
+                stats["std"].tolist(),
+            )
 
     dataset_size = len(dataset)
     holdout_size = max(1, math.ceil(dataset_size * 0.01))
@@ -447,6 +466,7 @@ def main() -> None:
                     "sigma_data": args.sigma_data,
                     "latent_mean": latent_mean.cpu(),
                     "latent_std": latent_std.cpu(),
+                    "use_single_vae_scaling": args.use_single_vae_scaling,
                 }
                 checkpoint_path = (
                     output_dir / f"edm_checkpoint_step_{global_samples}.pt"
@@ -476,6 +496,7 @@ def main() -> None:
                 "sigma_data": args.sigma_data,
                 "latent_mean": latent_mean.cpu(),
                 "latent_std": latent_std.cpu(),
+                "use_single_vae_scaling": args.use_single_vae_scaling,
             }
             checkpoint_path = output_dir / f"edm_checkpoint_step_{global_samples}.pt"
             torch.save(checkpoint, checkpoint_path)

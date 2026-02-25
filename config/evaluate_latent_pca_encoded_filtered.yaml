@@ -1,0 +1,8 @@
+latents_zarr: ./zarrs/encoded-latents-filtered.zarr
+output_dir: outputs/latent_pca/encoded-latents-filtered
+batch_size: 192
+num_workers: 8
+n_components: 10
+
+use_gpu: true
+num_gpus: 5

@@ -1,0 +1,64 @@
+# Config for VAE with attention training
+# Usage: python -m src.train.train_vae_attention --config config/train_vae_attention.yaml
+
+# Data
+zarr_path: /scratch/dhruman_gupta/noddyverse_preprocessed/output-final-old
+stats_path: ./vae_stats_filtered.json
+recompute_stats: false
+num_workers: 8
+prefetch_factor: 4
+persistent_workers: true
+stats_batch_size: 32
+
+filter_batch_size: 64
+filter_num_workers: 12
+filter_prefetch_factor: 4
+filter_persistent_workers: true
+
+# Model (VAE3DAttentionConfig)
+base_channels: 4
+latent_channels: 4
+bottleneck_channels: 32
+blocks_per_stage: 2
+num_attention_blocks: 2
+
+# Training
+batch_size: 3
+lr: 1.0e-4
+kl_weight: 0.01
+susc_active_threshold_log10: -1.5
+min_active_frac: 0.001
+low_info_keep_prob: 0.02
+filter_cache_path: ./cache/train_filter_stats.pt
+filter_cache_recompute: false
+
+# KL warmup (in samples processed): KL weight ramps 0 -> kl_weight over this many samples.
+kl_warmup_steps: 350000
+kl_zero_steps: 40000
+
+# LR warmup (in samples processed): LR ramps 0 -> lr over this many samples.
+warmup_steps: 50000
+grad_clip: 1.0
+seed: 42
+gradient_accumulation_steps: 1
+
+# Total number of samples to process before stopping.
+max_steps: 1000000
+
+# Run validation every N samples processed.
+eval_every_steps: 100000
+
+# Output
+output_dir: outputs/vae_attention_sweep_filtered
+
+# Save checkpoint every N samples processed.
+save_every: 100000
+
+# Log training metrics every N samples processed.
+log_every: 400
+
+# Progress bar on local main process.
+progress: false
+
+# Log per-epoch data vs compute timing on main process.
+profile: false

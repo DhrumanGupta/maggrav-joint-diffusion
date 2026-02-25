@@ -31,11 +31,12 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 import wandb
+
 from ..data.stats_utils import compute_latent_stats_ddp, load_stats, save_stats
 from ..models.flow import rectified_flow_loss, sample_rectified_flow
 from ..models.unet import UNet3DConfig, UNet3DDiffusion
 from ..utils.datasets import LatentZarrDataset
-from ..utils.masking import create_padding_mask
+from ..utils.stats import get_effective_std, get_global_std
 
 logging.basicConfig(
     format="%(asctime)s %(message)s",
@@ -43,6 +44,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+OVERFIT_SAMPLES = True
+NUM_SAMPLES_TO_OVERFIT = 10
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -78,6 +82,28 @@ def _infer_latent_config(dataset: LatentZarrDataset) -> Tuple[int, int]:
     return channels, depth
 
 
+def _extract_latent_batch(batch_payload: Any) -> torch.Tensor:
+    """Extract latent tensor from DataLoader batch payload.
+
+    LatentZarrDataset returns (weight, latent) pairs, which the default
+    DataLoader collate function materializes as a list/tuple of tensors.
+    """
+    if torch.is_tensor(batch_payload):
+        return batch_payload
+
+    if (
+        isinstance(batch_payload, (list, tuple))
+        and len(batch_payload) == 2
+        and torch.is_tensor(batch_payload[1])
+    ):
+        return batch_payload[1]
+
+    raise TypeError(
+        "Expected batch payload to be a Tensor or (weights, latents) pair; "
+        f"got {type(batch_payload)!r}."
+    )
+
+
 def main() -> None:
     args = parse_args()
     torch.set_float32_matmul_precision("high")
@@ -91,11 +117,10 @@ def main() -> None:
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    pad_to = max(args.pad_to, 1)
+    use_logvar = not args.no_logvar
     dataset = LatentZarrDataset(
         args.latents_zarr,
-        pad_to=pad_to,
-        use_logvar=not args.no_logvar,
+        use_logvar=use_logvar,
     )
     latent_channels, latent_spatial = _infer_latent_config(dataset)
 
@@ -105,17 +130,6 @@ def main() -> None:
         if args.stats_path is not None
         else output_dir / "latent_stats.json"
     )
-
-    # Create padding mask for stats computation (exclude padded regions)
-    stats_mask = None
-    if dataset.pad_amounts != (0, 0, 0):
-        stats_mask = create_padding_mask(
-            padded_shape=dataset.latent_shape,
-            original_spatial=dataset.original_spatial,
-            device=torch.device(
-                "cpu"
-            ),  # Will be moved to device in compute_latent_stats_ddp
-        )
 
     if stats_path.exists() and not args.recompute_stats:
         if accelerator.is_main_process:
@@ -130,8 +144,6 @@ def main() -> None:
             args.num_workers,
             accelerator,
             num_channels=latent_channels,
-            pad_to=pad_to,
-            mask=stats_mask,
         )
         if accelerator.is_main_process:
             save_stats(stats_path, stats)
@@ -142,24 +154,45 @@ def main() -> None:
 
     # Reshape mean/std for broadcasting: (1, C, 1, 1, 1)
     latent_mean = stats["mean"].float().view(1, latent_channels, 1, 1, 1)
-    latent_std = stats["std"].float().view(1, latent_channels, 1, 1, 1)
+
+    # Compute std: either global (single value) or per-channel
+    if args.use_single_vae_scaling:
+        # Use global std across all channels
+        global_std = get_global_std(stats, use_logvar)
+        latent_std = global_std.view(1, 1, 1, 1, 1).expand(1, latent_channels, 1, 1, 1)
+    else:
+        # Use per-channel std (current behavior)
+        latent_std = get_effective_std(stats, use_logvar).view(
+            1, latent_channels, 1, 1, 1
+        )
 
     if accelerator.is_main_process:
-        logger.info(
-            "Latent stats - mean: %s, std: %s",
-            stats["mean"].tolist(),
-            stats["std"].tolist(),
-        )
+        if args.use_single_vae_scaling:
+            logger.info(
+                "Latent stats - mean: %s, global std: %.6f (single scaling mode)",
+                stats["mean"].tolist(),
+                latent_std[0, 0, 0, 0, 0].item(),
+            )
+        else:
+            logger.info(
+                "Latent stats - mean: %s, std: %s (per-channel scaling)",
+                stats["mean"].tolist(),
+                stats["std"].tolist(),
+            )
 
     dataset_size = len(dataset)
     holdout_size = max(1, math.ceil(dataset_size * 0.01))
     train_size = dataset_size - holdout_size
+    if OVERFIT_SAMPLES:
+        train_size = NUM_SAMPLES_TO_OVERFIT
     if train_size <= 0:
         raise ValueError(
             "Zarr store must contain more than 1 sample to reserve 1% for holdout."
         )
 
     train_dataset = torch.utils.data.Subset(dataset, range(train_size))
+
+    accelerator.wait_for_everyone()
 
     loader_kwargs = dict(
         batch_size=args.batch_size,
@@ -168,6 +201,77 @@ def main() -> None:
     )
     if args.num_workers > 0:
         loader_kwargs.update(prefetch_factor=2, persistent_workers=True)
+
+    if accelerator.is_main_process and OVERFIT_SAMPLES:
+        # Plot latent depth slices for each sample in the training split.
+        latent_plots_dir = output_dir / "latents"
+        latent_plots_dir.mkdir(parents=True, exist_ok=True)
+        # Avoid mixing stale images from previous runs.
+        for existing_plot in latent_plots_dir.glob("*_slices.png"):
+            existing_plot.unlink()
+        for sample_idx in range(len(train_dataset)):
+            latent = train_dataset[sample_idx][1]
+            if latent.ndim == 5:
+                # If a batch axis is present, take the first sample.
+                latent = latent[0]
+            if latent.ndim != 4:
+                raise ValueError(
+                    f"Expected latent with shape [C, D, H, W], got {tuple(latent.shape)}"
+                )
+
+            latent_np = latent.detach().cpu().float().numpy()
+            finite_ratio = float(np.isfinite(latent_np).mean())
+            sample_std = float(np.nanstd(latent_np))
+            if finite_ratio < 1.0 or sample_std == 0.0:
+                logger.warning(
+                    "Sample %d has finite_ratio=%.4f and std=%.6f; plots may look blank.",
+                    sample_idx,
+                    finite_ratio,
+                    sample_std,
+                )
+            num_channels, depth, _, _ = latent_np.shape
+            num_cols = 4
+            num_rows = num_channels
+            fig, axes = plt.subplots(
+                num_rows, num_cols, figsize=(12, 4 * num_rows), squeeze=False
+            )
+            for c in range(num_channels):
+                for col_idx in range(num_cols):
+                    # Spread sampled slices across available depth.
+                    z = min(
+                        depth - 1,
+                        int(round(col_idx * (depth - 1) / max(1, num_cols - 1))),
+                    )
+                    ax = axes[c, col_idx]
+                    slice_2d = latent_np[c, z, :, :]
+                    finite_mask = np.isfinite(slice_2d)
+                    if not finite_mask.any():
+                        ax.set_facecolor("lightgray")
+                        ax.text(
+                            0.5,
+                            0.5,
+                            "all NaN/Inf",
+                            transform=ax.transAxes,
+                            ha="center",
+                            va="center",
+                            fontsize=9,
+                        )
+                    else:
+                        # Use percentile scaling so low-variance slices remain visible.
+                        vmin = float(np.nanpercentile(slice_2d, 1))
+                        vmax = float(np.nanpercentile(slice_2d, 99))
+                        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+                            vmin = float(np.nanmin(slice_2d))
+                            vmax = float(np.nanmax(slice_2d))
+                            if vmin == vmax:
+                                vmax = vmin + 1e-6
+                        ax.imshow(slice_2d, cmap="viridis", vmin=vmin, vmax=vmax)
+                    ax.set_title(f"ch{c} z={z}", fontsize=10)
+                    ax.axis("off")
+            plt.tight_layout()
+            fig_path = latent_plots_dir / f"{sample_idx}_slices.png"
+            plt.savefig(fig_path, dpi=150, bbox_inches="tight", facecolor="white")
+            plt.close(fig)
 
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
 
@@ -185,7 +289,7 @@ def main() -> None:
     model = UNet3DDiffusion(model_cfg)
 
     # Create EMA model for improved sample quality
-    ema_model = EMAModel(model.parameters(), decay=0.9999)
+    ema_model = EMAModel(model.parameters(), decay=0 if OVERFIT_SAMPLES else 0.9995)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -222,21 +326,6 @@ def main() -> None:
     # Move latent stats to device for normalization
     latent_mean = latent_mean.to(accelerator.device)
     latent_std = latent_std.to(accelerator.device)
-
-    # Create padding mask if there is padding (to keep padded regions at zero during training)
-    padding_mask = None
-    if dataset.pad_amounts != (0, 0, 0):
-        padding_mask = create_padding_mask(
-            padded_shape=dataset.latent_shape,
-            original_spatial=dataset.original_spatial,
-            device=accelerator.device,
-        )
-        if accelerator.is_main_process:
-            logger.info(
-                "Padding mask created: original %s -> padded %s",
-                dataset.original_spatial,
-                dataset.padded_spatial,
-            )
 
     if accelerator.is_main_process:
         total_params = sum(p.numel() for p in model.parameters())
@@ -290,16 +379,11 @@ def main() -> None:
 
         model.train()
         with accelerator.accumulate(model):
+            batch = _extract_latent_batch(batch)
             batch = batch.to(accelerator.device, non_blocking=True)
             # Normalize latents to zero mean, unit variance
             batch = (batch - latent_mean) / latent_std
-            loss = rectified_flow_loss(
-                model,
-                batch,
-                mask=padding_mask,
-                logit_mean=args.logit_mean,
-                logit_std=args.logit_std,
-            )
+            loss = rectified_flow_loss(model, batch)
 
             accelerator.backward(loss)
             if accelerator.sync_gradients and args.grad_clip > 0:
@@ -359,7 +443,6 @@ def main() -> None:
                     latent_shape=dataset.latent_shape,
                     num_steps=args.num_eval_steps,
                     device=accelerator.device,
-                    mask=padding_mask,
                 )
                 ema_model.restore(
                     unwrapped_model.parameters()
@@ -373,6 +456,37 @@ def main() -> None:
                     or samples.shape[4] != orig_w
                 ):
                     samples = samples[:, :, :orig_d, :orig_h, :orig_w]
+
+                first_sample = samples[0].detach().cpu().float().numpy()
+                num_channels, depth, _, _ = first_sample.shape
+                num_cols = 4
+                num_rows = num_channels
+                fig, axes = plt.subplots(
+                    num_rows, num_cols, figsize=(12, 4 * num_rows), squeeze=False
+                )
+                for c in range(num_channels):
+                    for i in range(num_cols):
+                        z = min(
+                            depth - 1,
+                            int(round(i * (depth - 1) / max(1, num_cols - 1))),
+                        )
+                        ax = axes[c, i]
+                        ax.imshow(first_sample[c, z, :, :], cmap="viridis")
+                        ax.set_title(f"ch{c} z={z}", fontsize=10)
+                        ax.axis("off")
+                plt.tight_layout()
+                fig_path = (
+                    output_dir
+                    / f"eval_first_generated_latent_step_{global_samples}.png"
+                )
+                plt.savefig(fig_path, dpi=150, bbox_inches="tight", facecolor="white")
+                if wandb_run is not None:
+                    wandb.log(
+                        {"eval/first_generated_latent": wandb.Image(fig)},
+                        step=global_samples,
+                    )
+                plt.close(fig)
+
                 mean_map = samples.mean(dim=0)
                 std_map = samples.std(dim=0)
 
@@ -428,6 +542,7 @@ def main() -> None:
                     "latent_shape": dataset.latent_shape,
                     "latent_mean": latent_mean.cpu(),
                     "latent_std": latent_std.cpu(),
+                    "use_single_vae_scaling": args.use_single_vae_scaling,
                 }
                 checkpoint_path = (
                     output_dir / f"flow_checkpoint_step_{global_samples}.pt"
@@ -456,6 +571,7 @@ def main() -> None:
                 "latent_shape": dataset.latent_shape,
                 "latent_mean": latent_mean.cpu(),
                 "latent_std": latent_std.cpu(),
+                "use_single_vae_scaling": args.use_single_vae_scaling,
             }
             checkpoint_path = output_dir / f"flow_checkpoint_step_{global_samples}.pt"
             torch.save(checkpoint, checkpoint_path)

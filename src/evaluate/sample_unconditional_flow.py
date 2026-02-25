@@ -28,7 +28,6 @@ from ..models.flow import sample_rectified_flow
 from ..models.unet import UNet3DConfig, UNet3DDiffusion
 from ..models.vae import VAE3D, VAE3DConfig
 from ..utils.checkpoint import clean_state_dict, load_checkpoint
-from ..utils.masking import create_padding_mask
 from ..utils.stats import load_stats
 
 logging.basicConfig(
@@ -194,27 +193,12 @@ def main() -> None:
             diffusion_cfg.input_spatial,
         )
 
-    # Get original spatial dimensions for cropping and mask
+    # Get original spatial dimensions for cropping
     if "original_spatial" in diffusion_ckpt:
         original_spatial = tuple(diffusion_ckpt["original_spatial"])
     else:
         # Fallback for older checkpoints - assume no padding
         original_spatial = latent_shape[1:]
-
-    # Create padding mask if there is padding
-    padding_mask = None
-    if original_spatial != latent_shape[1:]:
-        padding_mask = create_padding_mask(
-            padded_shape=latent_shape,
-            original_spatial=original_spatial,
-            device=device,
-        )
-        if accelerator.is_main_process:
-            logger.info(
-                "Padding mask created: original %s -> padded %s",
-                original_spatial,
-                latent_shape[1:],
-            )
 
     z_depth = original_spatial[0]  # Use original depth for plotting
     z_max = min(190, z_depth - 1)
@@ -252,7 +236,6 @@ def main() -> None:
                     latent_shape=latent_shape,
                     num_steps=args.num_steps,
                     device=device,
-                    mask=padding_mask,
                     autocast_context=accelerator.autocast(),
                 )
             # Denormalize latents back to original latent space

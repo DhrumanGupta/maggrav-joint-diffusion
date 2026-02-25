@@ -1,0 +1,52 @@
+# Config for training 3D DiT on raw Noddyverse data
+# Usage: python src/train/train_diffusion_dit.py --config config/train_diffusion_dit.yaml
+
+# Data
+zarr_path: "/scratch/dhruman_gupta/noddyverse_preprocessed/output-final-old"  # Adjust this path as needed
+no_logvar: false
+
+# Model Architecture (DiT-B equivalent)
+input_size: [200, 200, 200]
+patch_size: [20, 20, 20]
+patch_stride: [10, 10, 10]
+hidden_size: 768
+depth: 12
+num_heads: 12
+mlp_ratio: 4.0
+learn_sigma: false
+dropout: 0.0
+overlap_norm: true
+attn_backend: "xformers"
+
+# EDM Parameters
+sigma_data: 1   # Data std dev (approx, will be normalized anyway)
+sigma_min: 0.002
+sigma_max: 80.0
+rho: 7.0
+P_mean: -1.2
+P_std: 1.2
+
+# Training
+run_name: "dit-base"
+output_dir: "outputs/dit-base"
+seed: 42
+batch_size: 8
+gradient_accumulation_steps: 1  # No accumulation; use GPU memory for batch size instead
+num_workers: 8
+lr: 1e-4
+max_steps: 50000000
+warmup_samples: 1500000    # Linear warmup
+grad_clip: 1.0
+
+# Logging & Evaluation
+log_every: 2560      # Log loss every N samples
+eval_every_steps: 250000 # Generate samples every N samples (not steps)
+save_every: 250000   # Save checkpoint every N samples
+num_eval_samples: 2
+num_eval_steps: 64    # Heun steps for eval
+
+
+# Stats
+stats_batch_size: 32 # Batch size for computing dataset mean/std
+recompute_stats: false
+stats_path: vae_stats.json  # Auto-save to output_dir/dataset_stats.json
